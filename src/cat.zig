@@ -1,45 +1,17 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
-const posix = std.posix;
 
-pub fn main() !void {
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // const allocator = gpa.allocator();
-    // defer _ = gpa.deinit();
-
-    // const u: Uring = .init(16);
-
-    const addr: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
-
-    const optval: u32 = 1;
-    const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    try posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&optval));
-    try posix.bind(sockfd, &addr.any, addr.getOsSockLen());
-    try posix.listen(sockfd, 50);
-
-    while (true) {
-        var remoteaddr: posix.sockaddr.storage = undefined;
-        var addrlen: posix.socklen_t = posix.sockaddr.SS_MAXSIZE;
-        const connfd = try posix.accept(sockfd, @ptrCast(&remoteaddr), &addrlen, 0);
-        defer posix.close(connfd);
-
-        std.debug.print("Got connection from {any} at sock {d}\n", .{ addrlen, connfd });
-    }
-    // Create TCP socket
-    // submit ACCEPT
-    // for each accepted connection, submit READ
-    // for each READ, submit WRITE to downstream
-    // submit downstream READ, WRITE to upstream
-}
+const QUEUE_DEPTH = 1;
+var offset: usize = 0;
 
 const Uring = struct {
+    scratch: [1024]u8,
+    nb: u32,
     fd: i32,
     sq: Sq,
     cq: Cq,
 
     const Sq = struct {
-        off: u64,
         tail: *u32,
         mask: *u32,
         array: [*]u32,
@@ -52,9 +24,9 @@ const Uring = struct {
         cqes: [*]linux.io_uring_cqe,
     };
 
-    fn init(size: u32) Uring {
+    fn init() Uring {
         var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
-        const ring_fd = linux.io_uring_setup(size, &params);
+        const ring_fd = linux.io_uring_setup(QUEUE_DEPTH, &params);
         switch (linux.E.init(ring_fd)) {
             .SUCCESS => {},
             else => perror(ring_fd, "io_uring_setup", .{}),
@@ -86,7 +58,7 @@ const Uring = struct {
         const sq_ptr: *anyopaque = @ptrFromInt(sq_int);
 
         var cq_ptr: *anyopaque = sq_ptr;
-        var cq_int: u64 = @intFromPtr(cq_ptr);
+        var cq_int: usize = @intFromPtr(cq_ptr);
         if (params.features & linux.IORING_FEAT_SINGLE_MMAP == 0) {
             cq_int = linux.mmap(
                 null,
@@ -103,9 +75,9 @@ const Uring = struct {
             cq_ptr = @ptrFromInt(cq_int);
         }
 
-        const sring_tail: *u32 = @ptrFromInt(sq_int + @as(u64, params.sq_off.tail));
-        const sring_mask: *u32 = @ptrFromInt(sq_int + @as(u64, params.sq_off.ring_mask));
-        const sring_array: [*]u32 = @ptrFromInt(sq_int + @as(u64, params.sq_off.array));
+        const sring_tail: *u32 = @ptrFromInt(sq_int + @as(usize, params.sq_off.tail));
+        const sring_mask: *u32 = @ptrFromInt(sq_int + @as(usize, params.sq_off.ring_mask));
+        const sring_array: [*]u32 = @ptrFromInt(sq_int + @as(usize, params.sq_off.array));
 
         const sqes_int = linux.mmap(
             null,
@@ -122,13 +94,15 @@ const Uring = struct {
 
         const sqes: [*]linux.io_uring_sqe = @ptrFromInt(sqes_int);
 
-        const cring_head: *u32 = @ptrFromInt(cq_int + @as(u64, params.cq_off.head));
-        const cring_tail: *u32 = @ptrFromInt(cq_int + @as(u64, params.cq_off.tail));
-        const cring_mask: *u32 = @ptrFromInt(cq_int + @as(u64, params.cq_off.ring_mask));
+        const cring_head: *u32 = @ptrFromInt(cq_int + @as(usize, params.cq_off.head));
+        const cring_tail: *u32 = @ptrFromInt(cq_int + @as(usize, params.cq_off.tail));
+        const cring_mask: *u32 = @ptrFromInt(cq_int + @as(usize, params.cq_off.ring_mask));
 
-        const cqes: [*]linux.io_uring_cqe = @ptrFromInt(cq_int + @as(u64, params.cq_off.cqes));
+        const cqes: [*]linux.io_uring_cqe = @ptrFromInt(cq_int + @as(usize, params.cq_off.cqes));
 
         return .{
+            .scratch = @splat(0),
+            .nb = 0,
             .fd = @intCast(ring_fd),
             .cq = .{
                 .head = cring_head,
@@ -137,7 +111,6 @@ const Uring = struct {
                 .cqes = cqes,
             },
             .sq = .{
-                .off = 0,
                 .tail = sring_tail,
                 .mask = sring_mask,
                 .array = sring_array,
@@ -146,7 +119,7 @@ const Uring = struct {
         };
     }
 
-    fn submit(self: *Uring, fd: i32, op: linux.IORING_OP) void {
+    fn submit(self: *Uring, fd: i32, op: linux.IORING_OP) usize {
         var tail = self.sq.tail.*;
         const index = tail & self.sq.mask.*;
         var sqe: *linux.io_uring_sqe = &self.sq.sqes[index];
@@ -159,14 +132,58 @@ const Uring = struct {
         } else {
             sqe.len = self.nb;
         }
-        sqe.off = self.sq.off;
+        sqe.off = offset;
         self.sq.array[index] = index;
         tail += 1;
         @atomicStore(u32, self.sq.tail, tail, .release);
+
+        const ret = linux.io_uring_enter(self.fd, 1, 1, linux.IORING_ENTER_GETEVENTS, null);
+        switch (linux.E.init(ret)) {
+            .SUCCESS => {},
+            else => perror(ret, "io_uring_enter", .{}),
+        }
+
+        return ret;
+    }
+
+    fn read(self: *Uring) i32 {
+        var head = @atomicLoad(u32, self.cq.head, .acquire);
+        if (head == self.cq.tail.*) {
+            return -1;
+        }
+        const cqe = &self.cq.cqes[head & self.cq.mask.*];
+        if (cqe.res < 0) {
+            perror(@intCast(cqe.res), "cqe_read", .{});
+        }
+        head += 1;
+        @atomicStore(u32, self.cq.head, head, .release);
+
+        return cqe.res;
     }
 };
 
-pub fn perror(err: u64, comptime fmt: []const u8, args: anytype) noreturn {
+pub fn main() !void {
+    var uring: Uring = .init();
+
+    while (true) {
+        _ = uring.submit(linux.STDIN_FILENO, .READ);
+        const res = uring.read();
+        if (res > 0) {
+            uring.nb = @intCast(res);
+            _ = uring.submit(linux.STDOUT_FILENO, .WRITE);
+            _ = uring.read();
+            offset += @intCast(res);
+            continue;
+        }
+        if (res == 0) {
+            break;
+        }
+
+        unreachable;
+    }
+}
+
+pub fn perror(err: usize, comptime fmt: []const u8, args: anytype) noreturn {
     const e = linux.E.init(err);
     std.debug.print(fmt, args);
     std.debug.print(": {any}\n", .{e});
