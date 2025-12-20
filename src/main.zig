@@ -8,8 +8,7 @@ pub fn main() !void {
     // const allocator = gpa.allocator();
     // defer _ = gpa.deinit();
 
-    // const u: Uring = .init(16);
-
+    // const uring: Uring = .init(16);
     const addr: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
 
     const optval: u32 = 1;
@@ -19,13 +18,18 @@ pub fn main() !void {
     try posix.listen(sockfd, 50);
 
     while (true) {
-        var remoteaddr: posix.sockaddr.storage = undefined;
+        var remoteaddr: posix.sockaddr.in = undefined;
         var addrlen: posix.socklen_t = posix.sockaddr.SS_MAXSIZE;
         const connfd = try posix.accept(sockfd, @ptrCast(&remoteaddr), &addrlen, 0);
         defer posix.close(connfd);
+        const bytes: *const [4]u8 = @ptrCast(&remoteaddr.addr);
+        std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d} at sock {d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], remoteaddr.port, connfd });
 
-        std.debug.print("Got connection from {any} at sock {d}\n", .{ addrlen, connfd });
+        var read_buf: [4096]u8 = undefined;
+        const nb = try posix.read(connfd, &read_buf);
+        std.debug.print("READ from conn: {s}", .{read_buf[0..nb]});
     }
+
     // Create TCP socket
     // submit ACCEPT
     // for each accepted connection, submit READ
@@ -153,12 +157,7 @@ const Uring = struct {
         sqe.opcode = op;
         sqe.fd = fd;
         sqe.addr = @intFromPtr(&self.scratch);
-        if (op == linux.IORING_OP.READ) {
-            @memset(&self.scratch, 0);
-            sqe.len = self.scratch.len;
-        } else {
-            sqe.len = self.nb;
-        }
+        sqe.len = 0;
         sqe.off = self.sq.off;
         self.sq.array[index] = index;
         tail += 1;
