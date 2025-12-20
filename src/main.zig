@@ -8,7 +8,7 @@ pub fn main() !void {
     // const allocator = gpa.allocator();
     // defer _ = gpa.deinit();
 
-    // const uring: Uring = .init(16);
+    var uring: Uring = .init(16);
     const addr: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
 
     const optval: u32 = 1;
@@ -20,7 +20,10 @@ pub fn main() !void {
     while (true) {
         var remoteaddr: posix.sockaddr.in = undefined;
         var addrlen: posix.socklen_t = posix.sockaddr.SS_MAXSIZE;
-        const connfd = try posix.accept(sockfd, @ptrCast(&remoteaddr), &addrlen, 0);
+        uring.prep_accept(sockfd, @ptrCast(&remoteaddr), &addrlen);
+        _ = uring.wait(1, 1);
+
+        const connfd = uring.read();
         defer posix.close(connfd);
         const bytes: *const [4]u8 = @ptrCast(&remoteaddr.addr);
         std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d} at sock {d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], remoteaddr.port, connfd });
@@ -150,6 +153,18 @@ const Uring = struct {
         };
     }
 
+    fn prep_accept(self: *Uring, fd: i32, addr: ?*posix.sockaddr, addrlen: ?*posix.socklen_t) void {
+        var tail = self.sq.tail.*;
+        const index = tail & self.sq.mask.*;
+        var sqe: *linux.io_uring_sqe = &self.sq.sqes[index];
+
+        sqe.prep_accept(fd, addr, addrlen, 0);
+        self.sq.array[index] = index;
+
+        tail += 1;
+        @atomicStore(u32, self.sq.tail, tail, .release);
+    }
+
     fn submit(self: *Uring, fd: i32, op: linux.IORING_OP) void {
         var tail = self.sq.tail.*;
         const index = tail & self.sq.mask.*;
@@ -162,6 +177,30 @@ const Uring = struct {
         self.sq.array[index] = index;
         tail += 1;
         @atomicStore(u32, self.sq.tail, tail, .release);
+    }
+
+    fn read(self: *Uring) i32 {
+        var head = @atomicLoad(u32, self.cq.head, .acquire);
+        if (head == self.cq.tail.*) {
+            return -1;
+        }
+        const cqe = &self.cq.cqes[head & self.cq.mask.*];
+        if (cqe.res < 0) {
+            perror(@intCast(cqe.res), "cqe_read", .{});
+        }
+        head += 1;
+        @atomicStore(u32, self.cq.head, head, .release);
+
+        return cqe.res;
+    }
+
+    fn wait(self: *Uring, num_submit: u32, num_wait: u32) usize {
+        const ret = linux.io_uring_enter(self.fd, num_submit, num_wait, linux.IORING_ENTER_GETEVENTS, null);
+        // TODO: Improve error handling and return error enum
+        switch (linux.E.init(ret)) {
+            .SUCCESS => return ret,
+            else => perror(ret, "io_uring_enter", .{}),
+        }
     }
 };
 
