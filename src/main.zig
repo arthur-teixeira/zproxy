@@ -27,14 +27,15 @@ pub fn main() !void {
     accept_data.init(sockfd, .Accept);
     defer allocator.destroy(accept_data);
 
-    var accept_sqe = uring.get_sqe();
-    accept_sqe.prep_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen, 0);
+    var accept_sqe = uring.prep_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen);
     accept_sqe.user_data = @intFromPtr(accept_data);
-    uring.release_sqe();
 
     while (true) {
         const nevents = uring.wait(1, 1);
-        if (nevents == 0) continue;
+        if (nevents == 0) {
+            std.debug.print("Zero events\n", .{});
+            continue;
+        }
 
         const cqe = try uring.read();
         const cqe_data: *Data = @ptrFromInt(cqe.user_data);
@@ -43,20 +44,17 @@ pub fn main() !void {
             .Accept => {
                 const connfd = cqe.res;
                 const bytes: *const [4]u8 = @ptrCast(&accept_data.addr.addr);
-                std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d} at sock {d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port, connfd });
+                std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port });
 
                 var recv_data = try allocator.create(Data);
                 recv_data.init(connfd, .Recv);
                 recv_data.addr = accept_data.addr;
-                var recv_sqe = uring.get_sqe();
-                recv_sqe.prep_recv(connfd, &recv_data.buf, 0);
-                recv_sqe.user_data = @intFromPtr(recv_data);
-                uring.release_sqe();
 
-                accept_sqe = uring.get_sqe();
-                accept_sqe.prep_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen, 0);
+                var recv_sqe = uring.prep_recv(connfd, &recv_data.buf);
+                recv_sqe.user_data = @intFromPtr(recv_data);
+
+                accept_sqe = uring.prep_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen);
                 accept_sqe.user_data = @intFromPtr(accept_data);
-                uring.release_sqe();
             },
             .Recv => {
                 const nb = cqe.res;
@@ -226,18 +224,18 @@ const Uring = struct {
         @atomicStore(u32, self.sq.tail, tail + 1, .release);
     }
 
-    fn prep_accept(self: *Uring, fd: i32, addr: ?*posix.sockaddr, addrlen: ?*posix.socklen_t) void {
+    fn prep_accept(self: *Uring, fd: i32, addr: ?*posix.sockaddr, addrlen: ?*posix.socklen_t) *linux.io_uring_sqe {
         var sqe = self.get_sqe();
         defer self.release_sqe();
-        sqe.prep_multishot_accept(fd, addr, addrlen, 0);
-        sqe.user_data = @intFromEnum(SqType.Accept);
+        sqe.prep_accept(fd, addr, addrlen, 0);
+        return sqe;
     }
 
-    fn prep_recv(self: *Uring, fd: i32, buf: []u8) void {
+    fn prep_recv(self: *Uring, fd: i32, buf: []u8) *linux.io_uring_sqe {
         var sqe = self.get_sqe();
         defer self.release_sqe();
         sqe.prep_recv(fd, buf, 0);
-        sqe.user_data = @intFromEnum(SqType.Recv);
+        return sqe;
 
         // TODO: multishot with zero copy
         // sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
@@ -245,10 +243,12 @@ const Uring = struct {
         // sqe->zcrx_ifq_idx = zcrx_id;
     }
 
-    fn prep_send(self: *Uring, fd: i32, buf: []u8) void {
+    fn prep_send(self: *Uring, fd: i32, buf: []u8) *linux.io_uring_sqe {
         var sqe = self.get_sqe();
         defer self.release_sqe();
         sqe.prep_send(fd, buf, 0);
+
+        return sqe;
     }
 
     fn read(self: *Uring) !*linux.io_uring_cqe {
