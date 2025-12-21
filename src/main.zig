@@ -3,12 +3,7 @@ const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
 const posix = std.posix;
 
-pub fn main() !void {
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // const allocator = gpa.allocator();
-    // defer _ = gpa.deinit();
-
-    var uring: Uring = .init(16);
+fn setup_listener_sock() !i32 {
     const addr: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
 
     const optval: u32 = 1;
@@ -17,20 +12,64 @@ pub fn main() !void {
     try posix.bind(sockfd, &addr.any, addr.getOsSockLen());
     try posix.listen(sockfd, 50);
 
+    return sockfd;
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var uring: Uring = .init(16);
+
+    const sockfd = try setup_listener_sock();
+    var accept_data = try allocator.create(Data);
+    accept_data.init(sockfd, .Accept);
+    defer allocator.destroy(accept_data);
+
+    var accept_sqe = uring.get_sqe();
+    accept_sqe.prep_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen, 0);
+    accept_sqe.user_data = @intFromPtr(accept_data);
+    uring.release_sqe();
+
     while (true) {
-        var remoteaddr: posix.sockaddr.in = undefined;
-        var addrlen: posix.socklen_t = posix.sockaddr.SS_MAXSIZE;
-        uring.prep_accept(sockfd, @ptrCast(&remoteaddr), &addrlen);
-        _ = uring.wait(1, 1);
+        const nevents = uring.wait(1, 1);
+        if (nevents == 0) continue;
 
-        const connfd = uring.read();
-        defer posix.close(connfd);
-        const bytes: *const [4]u8 = @ptrCast(&remoteaddr.addr);
-        std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d} at sock {d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], remoteaddr.port, connfd });
+        const cqe = try uring.read();
+        const cqe_data: *Data = @ptrFromInt(cqe.user_data);
 
-        var read_buf: [4096]u8 = undefined;
-        const nb = try posix.read(connfd, &read_buf);
-        std.debug.print("READ from conn: {s}", .{read_buf[0..nb]});
+        switch (cqe_data.data_type) {
+            .Accept => {
+                const connfd = cqe.res;
+                const bytes: *const [4]u8 = @ptrCast(&accept_data.addr.addr);
+                std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d} at sock {d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port, connfd });
+
+                var recv_data = try allocator.create(Data);
+                recv_data.init(connfd, .Recv);
+                recv_data.addr = accept_data.addr;
+                var recv_sqe = uring.get_sqe();
+                recv_sqe.prep_recv(connfd, &recv_data.buf, 0);
+                recv_sqe.user_data = @intFromPtr(recv_data);
+                uring.release_sqe();
+
+                accept_sqe = uring.get_sqe();
+                accept_sqe.prep_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen, 0);
+                accept_sqe.user_data = @intFromPtr(accept_data);
+                uring.release_sqe();
+            },
+            .Recv => {
+                const nb = cqe.res;
+                std.debug.print("READ {d} bytes from conn: {s}", .{ nb, cqe_data.buf[0..@intCast(nb)] });
+                posix.close(cqe_data.connfd);
+                allocator.destroy(cqe_data);
+
+                // uring.prep_send(cqe., read_buf[0..@intCast(cqe_res.res)]);
+                // _ = uring.wait(1, 1);
+                // const written = try uring.read();
+                // std.debug.assert(cqe_res.res == written.res);
+            },
+        }
     }
 
     // Create TCP socket
@@ -39,6 +78,27 @@ pub fn main() !void {
     // for each READ, submit WRITE to downstream
     // submit downstream READ, WRITE to upstream
 }
+
+const SqType = enum {
+    Accept,
+    Recv,
+};
+
+const Data = struct {
+    addr: linux.sockaddr.in,
+    addrlen: linux.socklen_t,
+    data_type: SqType,
+    buf: [4096]u8,
+    connfd: i32,
+
+    fn init(self: *Data, connfd: i32, data_type: SqType) void {
+        self.buf = @splat(0);
+        self.addr = std.mem.zeroes(linux.sockaddr.in);
+        self.addrlen = linux.sockaddr.SS_MAXSIZE;
+        self.connfd = connfd;
+        self.data_type = data_type;
+    }
+};
 
 const Uring = struct {
     fd: i32,
@@ -64,7 +124,7 @@ const Uring = struct {
         const ring_fd = linux.io_uring_setup(size, &params);
         switch (linux.E.init(ring_fd)) {
             .SUCCESS => {},
-            else => perror(ring_fd, "io_uring_setup", .{}),
+            else => |err| perror(err, "io_uring_setup", .{}),
         }
 
         var sq_ring_size = params.sq_off.array + params.sq_entries * @sizeOf(c_uint);
@@ -87,7 +147,7 @@ const Uring = struct {
         );
         switch (linux.E.init(sq_int)) {
             .SUCCESS => {},
-            else => perror(sq_int, "mmap", .{}),
+            else => |err| perror(err, "mmap", .{}),
         }
 
         const sq_ptr: *anyopaque = @ptrFromInt(sq_int);
@@ -105,7 +165,7 @@ const Uring = struct {
             );
             switch (linux.E.init(cq_int)) {
                 .SUCCESS => {},
-                else => perror(cq_int, "mmap", .{}),
+                else => |err| perror(err, "mmap", .{}),
             }
             cq_ptr = @ptrFromInt(cq_int);
         }
@@ -124,7 +184,7 @@ const Uring = struct {
         );
         switch (linux.E.init(sqes_int)) {
             .SUCCESS => {},
-            else => perror(sqes_int, "mmap", .{}),
+            else => |err| perror(err, "mmap", .{}),
         }
 
         const sqes: [*]linux.io_uring_sqe = @ptrFromInt(sqes_int);
@@ -153,45 +213,59 @@ const Uring = struct {
         };
     }
 
+    inline fn get_sqe(self: *Uring) *linux.io_uring_sqe {
+        const tail = self.sq.tail.*;
+        const index = tail & self.sq.mask.*;
+        return &self.sq.sqes[index];
+    }
+
+    inline fn release_sqe(self: *Uring) void {
+        const tail = self.sq.tail.*;
+        const index = tail & self.sq.mask.*;
+        self.sq.array[index] = index;
+        @atomicStore(u32, self.sq.tail, tail + 1, .release);
+    }
+
     fn prep_accept(self: *Uring, fd: i32, addr: ?*posix.sockaddr, addrlen: ?*posix.socklen_t) void {
-        var tail = self.sq.tail.*;
-        const index = tail & self.sq.mask.*;
-        var sqe: *linux.io_uring_sqe = &self.sq.sqes[index];
-
-        sqe.prep_accept(fd, addr, addrlen, 0);
-        self.sq.array[index] = index;
-
-        tail += 1;
-        @atomicStore(u32, self.sq.tail, tail, .release);
+        var sqe = self.get_sqe();
+        defer self.release_sqe();
+        sqe.prep_multishot_accept(fd, addr, addrlen, 0);
+        sqe.user_data = @intFromEnum(SqType.Accept);
     }
 
-    fn submit(self: *Uring, fd: i32, op: linux.IORING_OP) void {
-        var tail = self.sq.tail.*;
-        const index = tail & self.sq.mask.*;
-        var sqe: *linux.io_uring_sqe = &self.sq.sqes[index];
-        sqe.opcode = op;
-        sqe.fd = fd;
-        sqe.addr = @intFromPtr(&self.scratch);
-        sqe.len = 0;
-        sqe.off = self.sq.off;
-        self.sq.array[index] = index;
-        tail += 1;
-        @atomicStore(u32, self.sq.tail, tail, .release);
+    fn prep_recv(self: *Uring, fd: i32, buf: []u8) void {
+        var sqe = self.get_sqe();
+        defer self.release_sqe();
+        sqe.prep_recv(fd, buf, 0);
+        sqe.user_data = @intFromEnum(SqType.Recv);
+
+        // TODO: multishot with zero copy
+        // sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+        // sqe.prep_rw(.RECV_ZC, fd, @intFromPtr(buf.ptr), buf.len, 0);
+        // sqe->zcrx_ifq_idx = zcrx_id;
     }
 
-    fn read(self: *Uring) i32 {
+    fn prep_send(self: *Uring, fd: i32, buf: []u8) void {
+        var sqe = self.get_sqe();
+        defer self.release_sqe();
+        sqe.prep_send(fd, buf, 0);
+    }
+
+    fn read(self: *Uring) !*linux.io_uring_cqe {
         var head = @atomicLoad(u32, self.cq.head, .acquire);
         if (head == self.cq.tail.*) {
-            return -1;
+            return error.EmptyCqRing;
         }
         const cqe = &self.cq.cqes[head & self.cq.mask.*];
-        if (cqe.res < 0) {
-            perror(@intCast(cqe.res), "cqe_read", .{});
+        const err = cqe.err();
+        // TODO: Improve error handling and return enum
+        if (err != .SUCCESS) {
+            perror(err, "cqe_read", .{});
         }
+
         head += 1;
         @atomicStore(u32, self.cq.head, head, .release);
-
-        return cqe.res;
+        return cqe;
     }
 
     fn wait(self: *Uring, num_submit: u32, num_wait: u32) usize {
@@ -199,13 +273,12 @@ const Uring = struct {
         // TODO: Improve error handling and return error enum
         switch (linux.E.init(ret)) {
             .SUCCESS => return ret,
-            else => perror(ret, "io_uring_enter", .{}),
+            else => |err| perror(err, "io_uring_enter", .{}),
         }
     }
 };
 
-pub fn perror(err: u64, comptime fmt: []const u8, args: anytype) noreturn {
-    const e = linux.E.init(err);
+pub fn perror(e: linux.E, comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print(fmt, args);
     std.debug.print(": {any}\n", .{e});
     linux.exit(1);
