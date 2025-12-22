@@ -20,17 +20,18 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var uring: Uring = .init(16);
+    var uring: Uring = try .init(16);
 
     const sockfd = try setup_listener_sock();
     var accept_data = try allocator.create(Data);
     accept_data.init(sockfd, .Accept);
     defer allocator.destroy(accept_data);
-    uring.prep_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen, accept_data);
+
+    uring.prep_multishot_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen, accept_data);
 
     while (true) {
         const nflushed = uring.flush_sq();
-        _ = uring.wait(nflushed, 1);
+        _ = try uring.submit_and_wait(nflushed, 1);
         for (0..uring.cq_ready()) |_| {
             const cqn = uring.read();
             std.debug.assert(cqn != null);
@@ -39,7 +40,7 @@ pub fn main() !void {
             if (cqe.user_data == 0) @panic("null pointer in user_data");
             const cqe_data: *Data = @ptrFromInt(cqe.user_data);
 
-            switch (cqe_data.data_type) {
+            switch (cqe_data.state) {
                 .Accept => {
                     const connfd = cqe.res;
                     const bytes: *const [4]u8 = @ptrCast(&accept_data.addr.addr);
@@ -49,18 +50,23 @@ pub fn main() !void {
                     recv_data.init(connfd, .Recv);
                     recv_data.addr = accept_data.addr;
 
-                    uring.prep_recv(connfd, &recv_data.buf, recv_data);
-                    uring.prep_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen, accept_data);
+                    uring.prep_recv(&recv_data.buf, recv_data);
                 },
                 .Recv => {
                     const nb = cqe.res;
-                    std.debug.print("READ {d} bytes from sock {d} : {s}", .{ nb, cqe_data.connfd, cqe_data.buf[0..@intCast(nb)] });
-                    cqe_data.data_type = .Send;
-                    uring.prep_send(cqe_data.connfd, cqe_data.buf[0..@intCast(nb)], cqe_data);
+                    std.debug.print("READ {d} bytes from sock {d} : {s}\n", .{ nb, cqe_data.connfd, cqe_data.buf[0..@intCast(nb)] });
+                    if (nb > 0) {
+                        uring.prep_send(cqe_data.buf[0..@intCast(nb)], cqe_data);
+                    } else {
+                        uring.prep_close(cqe_data);
+                    }
                 },
                 .Send => {
                     std.debug.print("SENT {d} bytes to sockfd, closing connection.\n", .{cqe.res});
-                    posix.close(cqe_data.connfd);
+                    uring.prep_close(cqe_data);
+                },
+                .Close => {
+                    std.debug.print("Connection to sock {d} successfully closed\n", .{cqe_data.connfd});
                     allocator.destroy(cqe_data);
                 },
             }
@@ -68,25 +74,26 @@ pub fn main() !void {
     }
 }
 
-const SqType = enum {
+const SqState = enum {
     Accept,
     Recv,
     Send,
+    Close,
 };
 
 const Data = struct {
     addr: linux.sockaddr.in,
     addrlen: linux.socklen_t,
-    data_type: SqType,
+    state: SqState,
     buf: [4096]u8,
     connfd: i32,
 
-    fn init(self: *Data, connfd: i32, data_type: SqType) void {
+    fn init(self: *Data, connfd: i32, data_type: SqState) void {
         self.buf = @splat(0);
         self.addr = std.mem.zeroes(linux.sockaddr.in);
         self.addrlen = linux.sockaddr.SS_MAXSIZE;
         self.connfd = connfd;
-        self.data_type = data_type;
+        self.state = data_type;
     }
 };
 
@@ -112,12 +119,19 @@ const Uring = struct {
         cqes: [*]linux.io_uring_cqe,
     };
 
-    fn init(size: u32) Uring {
+    fn init(size: u32) !Uring {
         var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
         const ring_fd = linux.io_uring_setup(size, &params);
         switch (linux.E.init(ring_fd)) {
             .SUCCESS => {},
-            else => |err| perror(err, "io_uring_setup", .{}),
+            .FAULT => return error.ParamsOutsideAccessibleAddressSpace,
+            .INVAL => return error.ArgumentsInvalid,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOMEM => return error.SystemResources,
+            .PERM => return error.PermissionDenied,
+            .NOSYS => return error.SystemOutdated,
+            else => |errno| return posix.unexpectedErrno(errno),
         }
 
         var sq_ring_size = params.sq_off.array + params.sq_entries * @sizeOf(c_uint);
@@ -217,15 +231,24 @@ const Uring = struct {
         return sqe;
     }
 
-    fn prep_accept(self: *Uring, fd: i32, addr: ?*posix.sockaddr, addrlen: ?*posix.socklen_t, data: *Data) void {
+    fn prep_multishot_accept(self: *Uring, fd: i32, addr: ?*posix.sockaddr, addrlen: ?*posix.socklen_t, data: *Data) void {
         var sqe = self.get_sqe();
-        sqe.prep_accept(fd, addr, addrlen, 0);
+        data.state = .Accept;
+        sqe.prep_multishot_accept(fd, addr, addrlen, 0);
         sqe.user_data = @intFromPtr(data);
     }
 
-    fn prep_recv(self: *Uring, fd: i32, buf: []u8, data: *Data) void {
+    fn prep_close(self: *Uring, data: *Data) void {
         var sqe = self.get_sqe();
-        sqe.prep_recv(fd, buf, 0);
+        sqe.prep_close(data.connfd);
+        data.state = .Close;
+        sqe.user_data = @intFromPtr(data);
+    }
+
+    fn prep_recv(self: *Uring, buf: []u8, data: *Data) void {
+        var sqe = self.get_sqe();
+        sqe.prep_recv(data.connfd, buf, 0);
+        data.state = .Recv;
         sqe.user_data = @intFromPtr(data);
 
         // TODO: multishot with zero copy
@@ -234,9 +257,10 @@ const Uring = struct {
         // sqe->zcrx_ifq_idx = zcrx_id;
     }
 
-    fn prep_send(self: *Uring, fd: i32, buf: []u8, data: *Data) void {
+    fn prep_send(self: *Uring, buf: []u8, data: *Data) void {
         var sqe = self.get_sqe();
-        sqe.prep_send(fd, buf, 0);
+        sqe.prep_send(data.connfd, buf, 0);
+        data.state = .Send;
         sqe.user_data = @intFromPtr(data);
     }
 
@@ -244,7 +268,6 @@ const Uring = struct {
         return @atomicLoad(u32, self.cq.tail, .acquire) -% self.cq.head.*;
     }
 
-    // TODO: Improve error handling and return enum
     // TODO: Probably better to copy CQEs to a slice and call atomic load/store only once since we know how many CQEs are ready with cq_ready()
     fn read(self: *Uring) ?*linux.io_uring_cqe {
         var head = @atomicLoad(u32, self.cq.head, .acquire);
@@ -253,10 +276,6 @@ const Uring = struct {
         }
 
         const cqe = &self.cq.cqes[head & self.cq.mask.*];
-        const err = cqe.err();
-        if (err != .SUCCESS) {
-            perror(err, "cqe_read", .{});
-        }
 
         head += 1;
         @atomicStore(u32, self.cq.head, head, .release);
@@ -283,13 +302,22 @@ const Uring = struct {
         return self.sq.sq_tail -% @atomicLoad(u32, self.sq.head, .acquire);
     }
 
-    fn wait(self: *Uring, num_submit: u32, num_wait: u32) usize {
-        const ret = linux.io_uring_enter(self.fd, num_submit, num_wait, linux.IORING_ENTER_GETEVENTS, null);
-        // TODO: Improve error handling and return error enum
-        switch (linux.E.init(ret)) {
-            .SUCCESS => return ret,
-            else => |err| perror(err, "io_uring_enter", .{}),
+    fn submit_and_wait(self: *Uring, num_submit: u32, num_wait: u32) !usize {
+        const res = linux.io_uring_enter(self.fd, num_submit, num_wait, linux.IORING_ENTER_GETEVENTS, null);
+        switch (linux.E.init(res)) {
+            .SUCCESS => {},
+            .AGAIN => return error.SystemResources,
+            .BADF => return error.FileDescriptorInvalid,
+            .BADFD => return error.FileDescriptorInBadState,
+            .BUSY => return error.CompletionQueueOvercommitted,
+            .INVAL => return error.SubmissionQueueEntryInvalid,
+            .FAULT => return error.BufferInvalid,
+            .NXIO => return error.RingShuttingDown,
+            .OPNOTSUPP => return error.OpcodeNotSupported,
+            .INTR => return error.SignalInterrupt,
+            else => |errno| return posix.unexpectedErrno(errno),
         }
+        return @as(u32, @intCast(res));
     }
 };
 
