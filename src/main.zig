@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
 const posix = std.posix;
+const assert = std.debug.assert;
 
 fn setup_listener_sock() !i32 {
     const addr: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
@@ -15,19 +16,34 @@ fn setup_listener_sock() !i32 {
     return sockfd;
 }
 
+fn resolve_upstream_addr(allocator: Allocator, name: []const u8, port: u16) !std.net.Ip4Address {
+    const list = try std.net.getAddressList(allocator, name, port);
+    defer list.deinit();
+    for (list.addrs) |addr| {
+        if (addr.any.family == posix.AF.INET6) continue;
+        return addr.in;
+    }
+
+    if (list.addrs.len > 0) return error.Ipv6NotSupported;
+    return error.InvalidHostname;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
+    const upstream_addr = try resolve_upstream_addr(allocator, "localhost", 3030);
+    std.debug.print("Upstream is {any}\n", .{upstream_addr});
+
     var uring: Uring = try .init(16);
 
     const sockfd = try setup_listener_sock();
     var accept_data = try allocator.create(Data);
-    accept_data.init(sockfd, .Accept);
+    accept_data.init(sockfd, .AcceptDown);
     defer allocator.destroy(accept_data);
 
-    uring.prep_multishot_accept(sockfd, @ptrCast(&accept_data.addr), &accept_data.addrlen, accept_data);
+    uring.prep_multishot_accept(sockfd, @ptrCast(&accept_data.downstream.addr), &accept_data.downstream.addrlen, accept_data);
 
     while (true) {
         const nflushed = uring.flush_sq();
@@ -41,59 +57,82 @@ pub fn main() !void {
             const cqe_data: *Data = @ptrFromInt(cqe.user_data);
 
             switch (cqe_data.state) {
-                .Accept => {
+                .AcceptDown => {
                     const connfd = cqe.res;
-                    const bytes: *const [4]u8 = @ptrCast(&accept_data.addr.addr);
-                    std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port });
+                    const bytes: *const [4]u8 = @ptrCast(&accept_data.downstream.addr.addr);
+                    std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], accept_data.downstream.addr.port });
 
                     var recv_data = try allocator.create(Data);
-                    recv_data.init(connfd, .Recv);
-                    recv_data.addr = accept_data.addr;
+                    recv_data.init(connfd, .RecvUp);
+                    recv_data.downstream.addr = accept_data.downstream.addr;
+                    recv_data.downstream.addrlen = accept_data.downstream.addrlen;
 
-                    uring.prep_recv(&recv_data.buf, recv_data);
+                    uring.prep_recv(&recv_data.downstream.buf, recv_data);
                 },
-                .Recv => {
+                .RecvUp => {
                     const nb = cqe.res;
-                    std.debug.print("READ {d} bytes from sock {d} : {s}\n", .{ nb, cqe_data.connfd, cqe_data.buf[0..@intCast(nb)] });
+                    std.debug.print("READ {d} bytes from sock {d} : {s}\n", .{ nb, cqe_data.downstream.fd, cqe_data.downstream.buf[0..@intCast(nb)] });
                     if (nb > 0) {
-                        uring.prep_send(cqe_data.buf[0..@intCast(nb)], cqe_data);
+                        uring.prep_send(cqe_data.downstream.buf[0..@intCast(nb)], cqe_data);
                     } else {
                         uring.prep_close(cqe_data);
                     }
                 },
-                .Send => {
+                .SendUp => {
                     std.debug.print("SENT {d} bytes to sockfd, closing connection.\n", .{cqe.res});
                     uring.prep_close(cqe_data);
                 },
                 .Close => {
-                    std.debug.print("Connection to sock {d} successfully closed\n", .{cqe_data.connfd});
+                    std.debug.print("Connection to sock {d} successfully closed\n", .{cqe_data.downstream.fd});
                     allocator.destroy(cqe_data);
                 },
+                else => unreachable,
             }
         }
     }
 }
 
+// Downstream => requesting client
+// Upstream => destination server(s)
+// (Ideal) State sequence
+// Accept (downstream) -> Socket(upstream) -> Connect (upstream) -> Send (upstream) -> Recv (upstream) -> Send (downstream) -> Close(upstream)
+//                     -> Recv (upstream)                                                                                   -> Close(downstream)
+//
+// (Current) State sequence
+// Accept (downstream) -> Recv (downstream) -> Socket (upstream) -> Connect (upstream) -> Send (upstream) -> Recv (upstream) -> Send (downstream) -> Close(downstream)
+//                                                                                                                           -> Close(upstream)
 const SqState = enum {
-    Accept,
-    Recv,
-    Send,
+    AcceptDown,
+    RecvDown,
+    SocketUp,
+    ConnectUp,
+    SendUp,
+    RecvUp,
+    SendDown,
     Close,
 };
 
 const Data = struct {
-    addr: linux.sockaddr.in,
-    addrlen: linux.socklen_t,
-    state: SqState,
-    buf: [4096]u8,
-    connfd: i32,
+    const Stream = struct {
+        addr: linux.sockaddr.in,
+        addrlen: linux.socklen_t,
+        buf: [4096]u8,
+        fd: i32,
+    };
 
-    fn init(self: *Data, connfd: i32, data_type: SqState) void {
-        self.buf = @splat(0);
-        self.addr = std.mem.zeroes(linux.sockaddr.in);
-        self.addrlen = linux.sockaddr.SS_MAXSIZE;
-        self.connfd = connfd;
-        self.state = data_type;
+    state: SqState,
+    downstream: Stream,
+    upstream: Stream,
+
+    fn init(self: *Data, connfd: i32, state: SqState) void {
+        self.state = state;
+        self.downstream = .{
+            .buf = @splat(0),
+            .addr = std.mem.zeroes(linux.sockaddr.in),
+            .addrlen = linux.sockaddr.SS_MAXSIZE,
+            .fd = connfd,
+        };
+        self.upstream = undefined;
     }
 };
 
@@ -233,34 +272,47 @@ const Uring = struct {
 
     fn prep_multishot_accept(self: *Uring, fd: i32, addr: ?*posix.sockaddr, addrlen: ?*posix.socklen_t, data: *Data) void {
         var sqe = self.get_sqe();
-        data.state = .Accept;
+        data.state = .AcceptDown;
         sqe.prep_multishot_accept(fd, addr, addrlen, 0);
         sqe.user_data = @intFromPtr(data);
     }
 
     fn prep_close(self: *Uring, data: *Data) void {
         var sqe = self.get_sqe();
-        sqe.prep_close(data.connfd);
+        sqe.prep_close(data.downstream.fd);
         data.state = .Close;
         sqe.user_data = @intFromPtr(data);
     }
 
     fn prep_recv(self: *Uring, buf: []u8, data: *Data) void {
         var sqe = self.get_sqe();
-        sqe.prep_recv(data.connfd, buf, 0);
-        data.state = .Recv;
+        sqe.prep_recv(data.downstream.fd, buf, 0);
+        data.state = .RecvUp;
         sqe.user_data = @intFromPtr(data);
+    }
 
-        // TODO: multishot with zero copy
-        // sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
-        // sqe.prep_rw(.RECV_ZC, fd, @intFromPtr(buf.ptr), buf.len, 0);
-        // sqe->zcrx_ifq_idx = zcrx_id;
+    fn prep_socket(self: *Uring, data: *Data) void {
+        assert(data.state == .AcceptDown);
+        var sqe = self.get_sqe();
+        data.state = .SocketUp;
+        sqe.prep_socket(linux.AF.INET, linux.SOCK.STREAM, 0, 0);
+        sqe.user_data = @intFromPtr(data);
+    }
+
+    fn prep_connect(self: *Uring, data: *Data) void {
+        assert(data.state == .SocketUp);
+        assert(data.upstream.fd > 0);
+        assert(data.upstream.addr.family == linux.AF.INET);
+
+        var sqe = self.get_sqe();
+        data.state = .ConnectUp;
+        sqe.prep_connect(data.upstream.fd, @ptrCast(&data.upstream.addr), data.upstream.addrlen);
     }
 
     fn prep_send(self: *Uring, buf: []u8, data: *Data) void {
         var sqe = self.get_sqe();
-        sqe.prep_send(data.connfd, buf, 0);
-        data.state = .Send;
+        sqe.prep_send(data.downstream.fd, buf, 0);
+        data.state = .SendUp;
         sqe.user_data = @intFromPtr(data);
     }
 
