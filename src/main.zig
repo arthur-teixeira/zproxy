@@ -16,12 +16,12 @@ fn setup_listener_sock() !i32 {
     return sockfd;
 }
 
-fn resolve_upstream_addr(allocator: Allocator, name: []const u8, port: u16) !std.net.Ip4Address {
+fn resolve_upstream_addr(allocator: Allocator, name: []const u8, port: u16) !std.net.Address {
     const list = try std.net.getAddressList(allocator, name, port);
     defer list.deinit();
     for (list.addrs) |addr| {
         if (addr.any.family == posix.AF.INET6) continue;
-        return addr.in;
+        return addr;
     }
 
     if (list.addrs.len > 0) return error.Ipv6NotSupported;
@@ -62,24 +62,48 @@ pub fn main() !void {
                     const bytes: *const [4]u8 = @ptrCast(&accept_data.downstream.addr.addr);
                     std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], accept_data.downstream.addr.port });
 
-                    var recv_data = try allocator.create(Data);
-                    recv_data.init(connfd, .RecvUp);
-                    recv_data.downstream.addr = accept_data.downstream.addr;
-                    recv_data.downstream.addrlen = accept_data.downstream.addrlen;
+                    var conn_data = try allocator.create(Data);
+                    conn_data.init(connfd, .RecvDown);
+                    conn_data.downstream.addr = accept_data.downstream.addr;
+                    conn_data.downstream.addrlen = accept_data.downstream.addrlen;
 
-                    uring.prep_recv(&recv_data.downstream.buf, recv_data);
+                    assert(upstream_addr.any.family == linux.AF.INET);
+                    conn_data.upstream.addr = upstream_addr.in.sa;
+                    conn_data.upstream.addrlen = upstream_addr.getOsSockLen();
+
+                    uring.prep_recv(&conn_data.downstream.buf, conn_data);
                 },
-                .RecvUp => {
+                .RecvDown => {
                     const nb = cqe.res;
                     std.debug.print("READ {d} bytes from sock {d} : {s}\n", .{ nb, cqe_data.downstream.fd, cqe_data.downstream.buf[0..@intCast(nb)] });
                     if (nb > 0) {
-                        uring.prep_send(cqe_data.downstream.buf[0..@intCast(nb)], cqe_data);
+                        cqe_data.downstream.pos = @intCast(nb);
+                        cqe_data.state = .SendDown;
+                        uring.prep_socket(cqe_data);
+                        // uring.prep_send(cqe_data.downstream.buf[0..@intCast(nb)], cqe_data);
                     } else {
+                        //FIXME: Handle errors!
+                        if (nb < 0) @panic("SHOULD HANDLE ERROR BETTER");
                         uring.prep_close(cqe_data);
                     }
                 },
+                .SocketUp => {
+                    std.debug.print("Created upstream socket {d}\n", .{cqe.res});
+                    cqe_data.upstream.fd = cqe.res;
+                    uring.prep_connect(cqe_data);
+                },
+                .ConnectUp => {
+                    std.debug.print("Connected to upstream on socket {d}: response {d}\n", .{ cqe_data.upstream.fd, cqe.res });
+                    // FIXME: This will possible be false when we start socket + recv concurrently if we connect before we recv from downstream
+                    assert(cqe_data.downstream.pos > 0);
+                    cqe_data.state = .SendUp;
+                    uring.prep_send(cqe_data.downstream.buf[0..@intCast(cqe_data.downstream.pos)], cqe_data);
+                },
                 .SendUp => {
-                    std.debug.print("SENT {d} bytes to sockfd, closing connection.\n", .{cqe.res});
+                    std.debug.print("SENT {d} bytes to UPSTREAM sockfd. Here we have to wait for a RECV and relay it to downstream.\n", .{cqe.res});
+                },
+                .SendDown => {
+                    std.debug.print("SENT {d} bytes to DOWNSTREAM sockfd, closing connection.\n", .{cqe.res});
                     uring.prep_close(cqe_data);
                 },
                 .Close => {
@@ -117,6 +141,7 @@ const Data = struct {
         addr: linux.sockaddr.in,
         addrlen: linux.socklen_t,
         buf: [4096]u8,
+        pos: u64,
         fd: i32,
     };
 
@@ -127,6 +152,7 @@ const Data = struct {
     fn init(self: *Data, connfd: i32, state: SqState) void {
         self.state = state;
         self.downstream = .{
+            .pos = 0,
             .buf = @splat(0),
             .addr = std.mem.zeroes(linux.sockaddr.in),
             .addrlen = linux.sockaddr.SS_MAXSIZE,
@@ -285,14 +311,14 @@ const Uring = struct {
     }
 
     fn prep_recv(self: *Uring, buf: []u8, data: *Data) void {
+        assert(data.state == .RecvDown or data.state == .RecvUp);
+
         var sqe = self.get_sqe();
         sqe.prep_recv(data.downstream.fd, buf, 0);
-        data.state = .RecvUp;
         sqe.user_data = @intFromPtr(data);
     }
 
     fn prep_socket(self: *Uring, data: *Data) void {
-        assert(data.state == .AcceptDown);
         var sqe = self.get_sqe();
         data.state = .SocketUp;
         sqe.prep_socket(linux.AF.INET, linux.SOCK.STREAM, 0, 0);
@@ -307,12 +333,15 @@ const Uring = struct {
         var sqe = self.get_sqe();
         data.state = .ConnectUp;
         sqe.prep_connect(data.upstream.fd, @ptrCast(&data.upstream.addr), data.upstream.addrlen);
+        sqe.user_data = @intFromPtr(data);
     }
 
     fn prep_send(self: *Uring, buf: []u8, data: *Data) void {
+        assert(data.state == .SendUp or data.state == .SendDown);
+        const fd = if (data.state == .SendUp) data.upstream.fd else data.downstream.fd;
+
         var sqe = self.get_sqe();
-        sqe.prep_send(data.downstream.fd, buf, 0);
-        data.state = .SendUp;
+        sqe.prep_send(fd, buf, 0);
         sqe.user_data = @intFromPtr(data);
     }
 
