@@ -41,4 +41,13 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_zproxy_cmd.addArgs(args);
     }
+
+    const up = b.step("mock", "Run ncat mock upstream");
+    const run = b.addSystemCommand(&[_][]const u8{
+        "sh",
+        "-c",
+        "ncat -k -l 3030 | tee",
+    });
+
+    up.dependOn(&run.step);
 }
