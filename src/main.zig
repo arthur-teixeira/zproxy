@@ -49,9 +49,7 @@ pub fn main() !void {
         const nflushed = uring.flush_sq();
         _ = try uring.submit_and_wait(nflushed, 1);
         for (0..uring.cq_ready()) |_| {
-            const cqn = uring.read();
-            std.debug.assert(cqn != null);
-            const cqe = cqn.?;
+            const cqe = uring.read().?;
 
             if (cqe.user_data == 0) @panic("null pointer in user_data");
             const cqe_data: *Data = @ptrFromInt(cqe.user_data);
@@ -71,25 +69,52 @@ pub fn main() !void {
                     conn_data.upstream.addr = upstream_addr.in.sa;
                     conn_data.upstream.addrlen = upstream_addr.getOsSockLen();
 
-                    uring.prep_recv(&conn_data.downstream.buf, conn_data);
+                    uring.prep_recv(conn_data);
+                },
+                .RecvUp => {
+                    const nb = cqe.res;
+                    if (nb > 0) {
+                        std.debug.print("READ {d} bytes from upstream sock {d} : {s}\n", .{ nb, cqe_data.upstream.fd, cqe_data.upstream.buf[0..@intCast(nb)] });
+                        cqe_data.upstream.pos += @intCast(nb);
+                        cqe_data.state = .SendDown;
+                        uring.prep_send(cqe_data);
+                    } else if (nb == 0) {
+                        std.debug.print("Upstream closed connection, closing reciprocal downstream socket\n", .{});
+                        cqe_data.state = .CloseDown;
+                        uring.prep_close(cqe_data);
+                    } else {
+                        const err: linux.E = @enumFromInt(-nb);
+                        std.debug.print("ERROR : {any}\n", .{err});
+                        @panic("SHOULD HANDLE ERROR BETTER");
+                    }
                 },
                 .RecvDown => {
                     const nb = cqe.res;
-                    std.debug.print("READ {d} bytes from sock {d} : {s}\n", .{ nb, cqe_data.downstream.fd, cqe_data.downstream.buf[0..@intCast(nb)] });
                     if (nb > 0) {
-                        cqe_data.downstream.pos = @intCast(nb);
-                        cqe_data.state = .SendDown;
-                        uring.prep_socket(cqe_data);
-                        // uring.prep_send(cqe_data.downstream.buf[0..@intCast(nb)], cqe_data);
-                    } else {
-                        //FIXME: Handle errors!
-                        if (nb < 0) @panic("SHOULD HANDLE ERROR BETTER");
+                        std.debug.print("READ {d} bytes from downstream sock {d} : {s}\n", .{ nb, cqe_data.downstream.fd, cqe_data.downstream.buf[0..@intCast(nb)] });
+                        cqe_data.downstream.pos += @intCast(nb);
+                        //TODO: concurrently start `uring.prep_recv(cqe_data)`
+                        //TODO: create upstream socket as soon as downstream is accepted
+                        if (cqe_data.upstream.fd > 0) {
+                            cqe_data.state = .SendUp;
+                            uring.prep_send(cqe_data);
+                        } else {
+                            uring.prep_socket(cqe_data);
+                        }
+                    } else if (nb == 0) {
+                        std.debug.print("Downstream closed connection, closing reciprocal upstream socket\n", .{});
+                        cqe_data.state = .CloseUp;
                         uring.prep_close(cqe_data);
+                    } else {
+                        const err: linux.E = @enumFromInt(-nb);
+                        std.debug.print("ERROR : {any}\n", .{err});
+                        @panic("SHOULD HANDLE ERROR BETTER");
                     }
                 },
                 .SocketUp => {
                     std.debug.print("Created upstream socket {d}\n", .{cqe.res});
-                    cqe_data.upstream.fd = cqe.res;
+                    assert(cqe.res > 0); // TODO: handle errors
+                    cqe_data.init_upstream(cqe.res);
                     uring.prep_connect(cqe_data);
                 },
                 .ConnectUp => {
@@ -97,20 +122,24 @@ pub fn main() !void {
                     // FIXME: This will possible be false when we start socket + recv concurrently if we connect before we recv from downstream
                     assert(cqe_data.downstream.pos > 0);
                     cqe_data.state = .SendUp;
-                    uring.prep_send(cqe_data.downstream.buf[0..@intCast(cqe_data.downstream.pos)], cqe_data);
+                    uring.prep_send(cqe_data);
                 },
                 .SendUp => {
-                    std.debug.print("SENT {d} bytes to UPSTREAM sockfd. Here we have to wait for a RECV and relay it to downstream.\n", .{cqe.res});
+                    std.debug.print("SENT {d} bytes to UPSTREAM sockfd {d}.\n", .{ cqe.res, cqe_data.upstream.fd });
+                    cqe_data.flush_downstream();
+                    cqe_data.state = .RecvUp;
+                    uring.prep_recv(cqe_data);
                 },
                 .SendDown => {
-                    std.debug.print("SENT {d} bytes to DOWNSTREAM sockfd, closing connection.\n", .{cqe.res});
-                    uring.prep_close(cqe_data);
+                    std.debug.print("SENT {d} bytes to DOWNSTREAM sockfd\n", .{cqe.res});
+                    cqe_data.state = .RecvDown;
+                    cqe_data.flush_upstream();
+                    uring.prep_recv(cqe_data);
                 },
-                .Close => {
-                    std.debug.print("Connection to sock {d} successfully closed\n", .{cqe_data.downstream.fd});
+                .CloseUp, .CloseDown => {
+                    std.debug.print("Connection {d} {d} successfully closed\n", .{ cqe_data.downstream.fd, cqe_data.upstream.fd });
                     allocator.destroy(cqe_data);
                 },
-                else => unreachable,
             }
         }
     }
@@ -119,29 +148,21 @@ pub fn main() !void {
 // Downstream => requesting client
 // Upstream => destination server(s)
 // (Ideal) State sequence
-// Accept (downstream) -> Socket(upstream) -> Connect (upstream) -> Send (upstream) -> Recv (upstream) -> Send (downstream) -> Close(upstream)
-//                     -> Recv (upstream)                                                                                   -> Close(downstream)
+// Accept (downstream) -> Socket(upstream) -> Connect (upstream) -> Send (upstream) -> Recv (upstream) -> Send (downstream)
+//                     -> Recv (downstream)
 //
 // (Current) State sequence
-// Accept (downstream) -> Recv (downstream) -> Socket (upstream) -> Connect (upstream) -> Send (upstream) -> Recv (upstream) -> Send (downstream) -> Close(downstream)
-//                                                                                                                           -> Close(upstream)
-const SqState = enum {
-    AcceptDown,
-    RecvDown,
-    SocketUp,
-    ConnectUp,
-    SendUp,
-    RecvUp,
-    SendDown,
-    Close,
-};
+// Accept (downstream) -> Recv (downstream) -> Socket (upstream) -> Connect (upstream) -> Send (upstream) -> Recv (upstream) -> Send (downstream)
+//                               | ^
+//                               |_|
+const SqState = enum { AcceptDown, RecvDown, SocketUp, ConnectUp, SendUp, RecvUp, SendDown, CloseUp, CloseDown };
 
 const Data = struct {
     const Stream = struct {
         addr: linux.sockaddr.in,
         addrlen: linux.socklen_t,
         buf: [4096]u8,
-        pos: u64,
+        pos: u32,
         fd: i32,
     };
 
@@ -158,7 +179,28 @@ const Data = struct {
             .addrlen = linux.sockaddr.SS_MAXSIZE,
             .fd = connfd,
         };
-        self.upstream = undefined;
+        self.upstream = .{
+            .pos = 0,
+            .buf = @splat(0),
+            .addr = std.mem.zeroes(linux.sockaddr.in),
+            .addrlen = linux.sockaddr.SS_MAXSIZE,
+            .fd = 0,
+        };
+    }
+
+    fn init_upstream(self: *Data, connfd: i32) void {
+        self.flush_upstream();
+        self.upstream.fd = connfd;
+    }
+
+    fn flush_upstream(self: *Data) void {
+        self.upstream.pos = 0;
+        self.upstream.buf = @splat(0);
+    }
+
+    fn flush_downstream(self: *Data) void {
+        self.downstream.pos = 0;
+        self.downstream.buf = @splat(0);
     }
 };
 
@@ -304,17 +346,20 @@ const Uring = struct {
     }
 
     fn prep_close(self: *Uring, data: *Data) void {
+        assert(data.state == .CloseDown or data.state == .CloseUp);
         var sqe = self.get_sqe();
-        sqe.prep_close(data.downstream.fd);
-        data.state = .Close;
+        const fd = if (data.state == .CloseUp) data.upstream.fd else data.downstream.fd;
+        sqe.prep_close(fd);
         sqe.user_data = @intFromPtr(data);
     }
 
-    fn prep_recv(self: *Uring, buf: []u8, data: *Data) void {
+    fn prep_recv(self: *Uring, data: *Data) void {
         assert(data.state == .RecvDown or data.state == .RecvUp);
-
         var sqe = self.get_sqe();
-        sqe.prep_recv(data.downstream.fd, buf, 0);
+        const fd = if (data.state == .RecvUp) data.upstream.fd else data.downstream.fd;
+        const buf = if (data.state == .RecvUp) &data.upstream.buf else &data.downstream.buf;
+        const pos = if (data.state == .RecvUp) data.upstream.pos else data.downstream.pos;
+        sqe.prep_recv(fd, buf, pos);
         sqe.user_data = @intFromPtr(data);
     }
 
@@ -336,12 +381,14 @@ const Uring = struct {
         sqe.user_data = @intFromPtr(data);
     }
 
-    fn prep_send(self: *Uring, buf: []u8, data: *Data) void {
+    fn prep_send(self: *Uring, data: *Data) void {
         assert(data.state == .SendUp or data.state == .SendDown);
         const fd = if (data.state == .SendUp) data.upstream.fd else data.downstream.fd;
+        const buf = if (data.state == .SendUp) data.downstream.buf else data.upstream.buf;
+        const pos = if (data.state == .SendUp) data.downstream.pos else data.upstream.pos;
 
         var sqe = self.get_sqe();
-        sqe.prep_send(fd, buf, 0);
+        sqe.prep_send(fd, buf[0..@intCast(pos)], 0);
         sqe.user_data = @intFromPtr(data);
     }
 

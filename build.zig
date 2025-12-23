@@ -46,7 +46,7 @@ pub fn build(b: *std.Build) void {
     const run = b.addSystemCommand(&[_][]const u8{
         "sh",
         "-c",
-        "ncat -k -l 3030 | tee",
+        "ncat -k -l 3030 -c 'cat | tee /dev/tty'",
     });
 
     up.dependOn(&run.step);
