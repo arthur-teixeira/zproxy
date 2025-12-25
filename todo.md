@@ -9,10 +9,11 @@
 
 - [X] Relay request to upstream
 - [X] Relay response to downstream
-- [ ] Improve Data representation
-    - [ ] split into two equal objects, one for upstream and one for downstream. Once pipe is estabilished, make one point to the other.
-    - [ ] each data entity should have a standalone state
+- [X] Improve Data representation
+    - [X] split into two equal objects, one for upstream and one for downstream.
+    - [X] each data entity should have a standalone state
 - [ ] Configure multiple upstreams for load balancing
+- [ ] Ipv6 support
 - [ ] Connection pool with upstream or 1-to-1 socket?
     - Pool is harder but more efficient
     - Enqueue requests and split them up into keepalive connections
