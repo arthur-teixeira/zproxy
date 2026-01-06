@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(zproxy_exe);
 
-    const run_zproxy_step = b.step("run", "Run zproxy example");
+    const run_zproxy_step = b.step("run", "Run zproxy");
     const run_zproxy_cmd = b.addRunArtifact(zproxy_exe);
     run_zproxy_step.dependOn(&run_zproxy_cmd.step);
     run_zproxy_cmd.step.dependOn(b.getInstallStep());
@@ -31,4 +31,12 @@ pub fn build(b: *std.Build) void {
     });
 
     up.dependOn(&run.step);
+
+    const test_step = b.step("test", "Run tests");
+    const tests = b.addTest(.{
+        .root_module = zproxy_exe.root_module,
+    });
+
+    const run_tests = b.addRunArtifact(tests);
+    test_step.dependOn(&run_tests.step);
 }
