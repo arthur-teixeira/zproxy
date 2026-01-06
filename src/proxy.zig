@@ -29,7 +29,8 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
 
     while (running == null or running.?.load(.monotonic)) {
         const nflushed = uring.flush_sq();
-        _ = try uring.submit_and_wait(nflushed, 1);
+        // TODO: change the 0 parameter back to one and add a timeout event, since this is used only for testing
+        _ = try uring.submit_and_wait(nflushed, 0);
         for (0..uring.cq_ready()) |_| {
             const cqe = uring.read().?;
             if (cqe.user_data == 0) @panic("null pointer in user_data");
@@ -65,10 +66,12 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                             uring.prep_socket(opposing_socket);
                         }
                     } else if (nb == 0) {
-                        assert(cqe_data.opposing != null);
-                        std.debug.print("Socket closed connection, closing reciprocal socket\n", .{});
+                        std.debug.print("Socket closed connection\n", .{});
                         cqe_data.state = .Close;
-                        uring.prep_close(cqe_data.opposing.?);
+                        if (cqe_data.opposing) |opp| {
+                            std.debug.print("Closing reciprocal socket\n", .{});
+                            uring.prep_close(opp);
+                        }
                     } else {
                         const err: linux.E = @enumFromInt(-nb);
                         std.debug.print("ERROR : {any}\n", .{err});
