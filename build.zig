@@ -1,5 +1,21 @@
 const std = @import("std");
 
+const BuildOptions = struct {
+    testing: bool,
+
+    fn create(self: BuildOptions, b: *std.Build) *std.Build.Step.Options {
+        const opts: *std.Build.Step.Options = .create(b);
+        opts.addOption(bool, "testing", self.testing);
+
+        return opts;
+    }
+
+    fn set(self: BuildOptions, b: *std.Build, exe: *std.Build.Step.Compile) void {
+        const opts = self.create(b);
+        exe.root_module.addOptions("build_options", opts);
+    }
+};
+
 fn build_zproxy(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     const zproxy_exe = b.addExecutable(.{
         .name = "zproxy",
@@ -11,6 +27,11 @@ fn build_zproxy(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         }),
     });
     b.installArtifact(zproxy_exe);
+
+    const opts: BuildOptions = .{
+        .testing = false,
+    };
+    opts.set(b, zproxy_exe);
 
     const run_zproxy_step = b.step("run", "Run zproxy");
     const run_zproxy_cmd = b.addRunArtifact(zproxy_exe);
@@ -42,6 +63,11 @@ fn build_echo_tester(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
         }),
     });
     b.installArtifact(zproxy_exe);
+
+    const opts: BuildOptions = .{
+        .testing = true,
+    };
+    opts.set(b, zproxy_exe);
 
     const run_zproxy_step = b.step("echo_test", "Run zproxy Echo tester");
     const run_zproxy_cmd = b.addRunArtifact(zproxy_exe);

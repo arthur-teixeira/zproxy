@@ -9,9 +9,10 @@
 
 - [X] Relay request to upstream
 - [X] Relay response to downstream
-- [X] Improve Data representation
+- Improve Data representation
     - [X] split into two equal objects, one for upstream and one for downstream.
     - [X] each data entity should have a standalone state
+    - [ ] create objects inside an object pool and replace all pointers with indices into the pool
 - [ ] Configure multiple upstreams for load balancing
 - [ ] Ipv6 support
 - [ ] Connection pool with upstream or 1-to-1 socket?
@@ -23,5 +24,5 @@
 
 ## Testing/Quality
 - [ ] Fuzz testing somewhere ?
+- [X] E2E testing framework
 - [ ] Perf/Stress testing
-

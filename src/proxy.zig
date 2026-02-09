@@ -1,10 +1,20 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
+const opts = @import("build_options");
 const posix = std.posix;
 const assert = std.debug.assert;
 const Stream = @import("./Stream.zig");
 const Uring = @import("./Uring.zig");
+
+pub const test_sync = if (opts.testing)
+    struct {
+        pub var cond = std.Thread.Condition{};
+        pub var ready = false;
+        pub var mutex = std.Thread.Mutex{};
+    }
+else
+    struct {};
 
 fn setup_listener_sock() !i32 {
     const addr: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
@@ -27,9 +37,15 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
 
     uring.prep_multishot_accept(accept_data);
 
+    if (opts.testing) {
+        test_sync.mutex.lock();
+        test_sync.ready = true;
+        test_sync.mutex.unlock();
+        test_sync.cond.signal();
+    }
+
     while (running == null or running.?.load(.monotonic)) {
         const nflushed = uring.flush_sq();
-        // TODO: change the 0 parameter back to one and add a timeout event, since this is used only for testing
         _ = try uring.submit_and_wait(nflushed, 0);
         for (0..uring.cq_ready()) |_| {
             const cqe = uring.read().?;
