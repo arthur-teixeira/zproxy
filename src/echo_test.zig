@@ -8,6 +8,7 @@ const proxy = p.proxy;
 const opts = @import("build_options");
 
 const MESSAGE_SIZE = 256;
+const PROXY_ADDR: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
 
 fn get_addr(allocator: Allocator) !net.Address {
     const list = try std.net.getAddressList(allocator, "localhost", 3030);
@@ -143,7 +144,7 @@ pub fn main() !void {
     for (0..num_clients) |i| {
         const msg = try std.fmt.allocPrint(allocator, "client-{d}", .{i});
         var c: Test.Client = .init(msg, msg);
-        try c.run(test_case.server_addr);
+        try c.run(PROXY_ADDR);
         clients[i] = c;
     }
 
