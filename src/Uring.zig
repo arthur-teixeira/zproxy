@@ -129,57 +129,54 @@ pub inline fn get_sqe(self: *Uring) *linux.io_uring_sqe {
     return sqe;
 }
 
-pub fn prep_multishot_accept(self: *Uring, data: *Stream) void {
+pub fn prep_multishot_accept(self: *Uring, key: Stream.Key, data: *Stream) void {
     assert(data.state == .Accept);
     var sqe = self.get_sqe();
     sqe.prep_multishot_accept(data.fd, @ptrCast(&data.addr), &data.addrlen, 0);
-    sqe.user_data = @intFromPtr(data);
+    sqe.user_data = @intFromEnum(key);
 }
 
-pub fn prep_close(self: *Uring, data: *Stream) void {
+pub fn prep_close(self: *Uring, key: Stream.Key, data: *Stream) void {
     // should only close an end if the other end closed first
-    assert(data.opposing != null);
-    assert(data.opposing.?.state == .Close);
     data.state = .Close;
     var sqe = self.get_sqe();
     sqe.prep_close(data.fd);
-    sqe.user_data = @intFromPtr(data);
+    sqe.user_data = @intFromEnum(key);
 }
 
-pub fn prep_recv(self: *Uring, data: *Stream) void {
+pub fn prep_recv(self: *Uring, key: Stream.Key, data: *Stream) void {
     data.state = .Recv;
     var sqe = self.get_sqe();
     sqe.prep_recv(data.fd, &data.buf, data.pos);
-    sqe.user_data = @intFromPtr(data);
+    sqe.user_data = @intFromEnum(key);
 }
 
-pub fn prep_socket(self: *Uring, data: *Stream) void {
+pub fn prep_socket(self: *Uring, key: Stream.Key, data: *Stream) void {
     assert(data.fd == 0);
-    assert(data.opposing != null);
     var sqe = self.get_sqe();
     data.state = .Socket;
     sqe.prep_socket(linux.AF.INET, linux.SOCK.STREAM, 0, 0);
-    sqe.user_data = @intFromPtr(data);
+    sqe.user_data = @intFromEnum(key);
 }
 
-pub fn prep_connect(self: *Uring, data: *Stream) void {
+pub fn prep_connect(self: *Uring, key: Stream.Key, data: *Stream) void {
     assert(data.state == .Socket);
     assert(data.fd > 0);
     assert(data.addr.family == linux.AF.INET);
     var sqe = self.get_sqe();
     data.state = .Connect;
     sqe.prep_connect(data.fd, @ptrCast(&data.addr), data.addrlen);
-    sqe.user_data = @intFromPtr(data);
+    sqe.user_data = @intFromEnum(key);
 }
 
-pub fn prep_send(self: *Uring, data: *Stream) void {
+pub fn prep_send(self: *Uring, key: Stream.Key, data: *Stream, opposing: ?*Stream) void {
     // SEND data buf to OPPOSING fd
-    assert(data.opposing != null);
+    assert(opposing != null);
     assert(data.pos > 0);
     data.state = .Send;
     var sqe = self.get_sqe();
-    sqe.prep_send(data.opposing.?.fd, data.buf[0..@intCast(data.pos)], 0);
-    sqe.user_data = @intFromPtr(data);
+    sqe.prep_send(opposing.?.fd, data.buf[0..@intCast(data.pos)], 0);
+    sqe.user_data = @intFromEnum(key);
 }
 
 pub fn cq_ready(self: *Uring) u32 {
