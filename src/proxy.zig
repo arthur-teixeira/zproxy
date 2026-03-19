@@ -41,16 +41,15 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
 
     uring.prep_multishot_accept(accept_key, accept_data);
 
-    if (opts.testing) {
-        test_sync.mutex.lock();
-        test_sync.ready = true;
-        test_sync.mutex.unlock();
-        test_sync.cond.signal();
-    }
-
     while (running == null or running.?.load(.monotonic)) {
         const nflushed = uring.flush_sq();
         _ = try uring.submit_and_wait(nflushed, 0);
+        if (opts.testing and !test_sync.ready) {
+            test_sync.mutex.lock();
+            test_sync.ready = true;
+            test_sync.mutex.unlock();
+            test_sync.cond.signal();
+        }
         for (0..uring.cq_ready()) |_| {
             const cqe = uring.read().?;
             const cqe_key: Stream.Key = @enumFromInt(cqe.user_data);
@@ -135,7 +134,7 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                     }
                 },
                 .Close => {
-                    std.debug.print("Connection {d} successfully closed\n", .{ cqe_data.fd });
+                    std.debug.print("Connection {d} successfully closed\n", .{cqe_data.fd});
                 },
             }
         }
