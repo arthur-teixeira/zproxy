@@ -22,7 +22,7 @@ fn get_addr(allocator: Allocator) !net.Address {
 }
 
 fn handle_conn(conn: net.Server.Connection) !void {
-    errdefer conn.stream.close();
+    defer conn.stream.close();
 
     while (true) {
         var buf: [MESSAGE_SIZE]u8 = undefined;
@@ -126,6 +126,9 @@ const Test = struct {
         self.server_thread.join();
         self.proxy_signal.store(false, .monotonic);
         self.proxy_thread.join();
+        p.test_sync.mutex.lock();
+        p.test_sync.ready = false;
+        p.test_sync.mutex.unlock();
     }
 };
 
@@ -134,6 +137,17 @@ pub fn main() !void {
     defer _ = dba.deinit();
     const allocator = dba.allocator();
 
+    try test_concurrent(allocator);
+    try test_serial(allocator);
+    _ = dba.detectLeaks();
+}
+
+fn run_client(client: *Test.Client) !void {
+    try client.run(PROXY_ADDR);
+    try client.get_response();
+}
+
+fn test_concurrent(allocator: Allocator) !void {
     const addr = get_addr(allocator) catch unreachable;
 
     const num_clients: usize = 10;
@@ -141,15 +155,31 @@ pub fn main() !void {
     try test_case.start(num_clients);
 
     var clients: [num_clients]Test.Client = undefined;
+    var threads: [num_clients]std.Thread = undefined;
+
+    for (0..num_clients) |i| {
+        const msg = try std.fmt.allocPrint(allocator, "client-{d}", .{i});
+        clients[i] = .init(msg, msg);
+        threads[i] = try std.Thread.spawn(.{}, run_client, .{&clients[i]});
+    }
+
+    for (threads) |t| t.join();
+    for (clients) |c| allocator.free(c.req);
+
+    test_case.wait_completion();
+}
+
+fn test_serial(allocator: Allocator) !void {
+    const addr = get_addr(allocator) catch unreachable;
+
+    const num_clients: usize = 10;
+    var test_case: Test = .init(allocator, addr);
+    try test_case.start(num_clients);
+
     for (0..num_clients) |i| {
         const msg = try std.fmt.allocPrint(allocator, "client-{d}", .{i});
         var c: Test.Client = .init(msg, msg);
         try c.run(PROXY_ADDR);
-        clients[i] = c;
-    }
-
-    for (0..num_clients) |i| {
-        var c = clients[i];
         try c.get_response();
         allocator.free(c.req);
     }

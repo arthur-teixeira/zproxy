@@ -30,7 +30,9 @@ fn setup_listener_sock() !i32 {
 
 pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*std.atomic.Value(bool)) !void {
     var uring: Uring = try .init(16);
+    defer uring.deinit();
     const sockfd = try setup_listener_sock();
+    defer posix.close(sockfd);
 
     var conn_pool = try Stream.Pool.init(allocator, 32);
     defer conn_pool.deinit();
@@ -41,7 +43,7 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
 
     uring.prep_multishot_accept(accept_key, accept_data);
 
-    while (running == null or running.?.load(.monotonic)) {
+    while (true) {
         const nflushed = uring.flush_sq();
         _ = try uring.submit_and_wait(nflushed, 0);
         if (opts.testing and !test_sync.ready) {
@@ -136,6 +138,18 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                 .Close => {
                     std.debug.print("Connection {d} successfully closed\n", .{cqe_data.fd});
                 },
+                .Cancel => {
+                    std.debug.print("Ring cancelled and all operations processed\n", .{});
+                    return;
+                },
+            }
+        }
+
+        if (running) |v| {
+            if (!v.load(.monotonic) and accept_data.state != .Cancel) {
+                std.debug.print("Got an interrupt signal, cancelling the ring\n", .{});
+                accept_data.state = .Cancel;
+                try uring.prep_cancel(accept_key);
             }
         }
     }

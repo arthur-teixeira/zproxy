@@ -9,6 +9,7 @@ const Uring = @This();
 fd: i32,
 sq: Sq,
 cq: Cq,
+single_mmap: bool,
 
 const Sq = struct {
     sq_tail: u32,
@@ -19,8 +20,10 @@ const Sq = struct {
     mask: *u32,
     array: [*]u32,
     sqes: [*]linux.io_uring_sqe,
+    size: u64,
 };
 const Cq = struct {
+    size: u64,
     head: *u32,
     tail: *u32,
     mask: *u32,
@@ -45,7 +48,9 @@ pub fn init(size: u32) !Uring {
     var sq_ring_size = params.sq_off.array + params.sq_entries * @sizeOf(c_uint);
     var cq_ring_size = params.cq_off.cqes + params.cq_entries * @sizeOf(linux.io_uring_cqe);
 
-    if (params.features & linux.IORING_FEAT_SINGLE_MMAP > 0) {
+    const single_mmap = params.features & linux.IORING_FEAT_SINGLE_MMAP > 0;
+
+    if (single_mmap) {
         if (cq_ring_size > sq_ring_size) {
             sq_ring_size = cq_ring_size;
         }
@@ -65,7 +70,7 @@ pub fn init(size: u32) !Uring {
 
     var cq_ptr: *anyopaque = sq_ptr;
     var cq_int: u64 = @intFromPtr(cq_ptr);
-    if (params.features & linux.IORING_FEAT_SINGLE_MMAP == 0) {
+    if (!single_mmap) {
         cq_int = linux.mmap(
             null,
             cq_ring_size,
@@ -103,11 +108,13 @@ pub fn init(size: u32) !Uring {
 
     return .{
         .fd = @intCast(ring_fd),
+        .single_mmap = single_mmap,
         .cq = .{
             .head = cring_head,
             .tail = cring_tail,
             .mask = cring_mask,
             .cqes = cqes,
+            .size = cq_ring_size,
         },
         .sq = .{
             .sq_tail = 0,
@@ -118,8 +125,18 @@ pub fn init(size: u32) !Uring {
             .mask = sring_mask,
             .array = sring_array,
             .sqes = sqes,
+            .size = sq_ring_size,
         },
     };
+}
+
+pub fn deinit(self: *Uring) void {
+    posix.close(self.fd);
+    // self.sq.sqes;
+    // self.sq.sqes;
+    // if (self.single_mmap) {
+    //
+    // }
 }
 
 pub inline fn get_sqe(self: *Uring) *linux.io_uring_sqe {
@@ -133,6 +150,14 @@ pub fn prep_multishot_accept(self: *Uring, key: Stream.Key, data: *Stream) void 
     assert(data.state == .Accept);
     var sqe = self.get_sqe();
     sqe.prep_multishot_accept(data.fd, @ptrCast(&data.addr), &data.addrlen, 0);
+    sqe.user_data = @intFromEnum(key);
+}
+
+pub fn prep_cancel(self: *Uring, key: Stream.Key) !void {
+    var sqe = self.get_sqe();
+    sqe.* = std.mem.zeroes(linux.io_uring_sqe);
+    sqe.opcode = .ASYNC_CANCEL;
+    sqe.addr = @intFromEnum(key);
     sqe.user_data = @intFromEnum(key);
 }
 

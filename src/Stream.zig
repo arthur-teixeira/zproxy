@@ -27,6 +27,7 @@ pub const State = enum {
     Connect,
     Send,
     Close,
+    Cancel,
 };
 
 const Stream = @This();
@@ -101,6 +102,7 @@ pub const Pool = struct {
     }
 
     pub fn get(self: Pool, key: Key) *Stream {
+        assert(self.slots[@intFromEnum(key)].in_use);
         return &self.slots[@intFromEnum(key)].stream;
     }
 };
