@@ -63,7 +63,7 @@ const Test = struct {
     const Client = struct {
         req: []const u8,
         res: []const u8,
-        scratch: [4096]u8,
+        scratch: [40960]u8,
         sock: std.net.Stream,
 
         fn init(req: []const u8, res: []const u8) Client {
@@ -139,6 +139,8 @@ pub fn main() !void {
 
     try test_concurrent(allocator);
     try test_serial(allocator);
+    try test_connection_pool_exhaustion(allocator);
+    try test_large_messages(allocator);
     _ = dba.detectLeaks();
 }
 
@@ -178,6 +180,55 @@ fn test_serial(allocator: Allocator) !void {
 
     for (0..num_clients) |i| {
         const msg = try std.fmt.allocPrint(allocator, "client-{d}", .{i});
+        var c: Test.Client = .init(msg, msg);
+        try c.run(PROXY_ADDR);
+        try c.get_response();
+        allocator.free(c.req);
+    }
+
+    test_case.wait_completion();
+}
+
+fn test_connection_pool_exhaustion(allocator: Allocator) !void {
+    const addr = get_addr(allocator) catch unreachable;
+
+    const num_clients: usize = 128;
+    var test_case: Test = .init(allocator, addr);
+    try test_case.start(num_clients);
+
+    for (0..num_clients) |i| {
+        const msg = try std.fmt.allocPrint(allocator, "client-{d}", .{i});
+        var c: Test.Client = .init(msg, msg);
+        try c.run(PROXY_ADDR);
+        try c.get_response();
+        allocator.free(c.req);
+    }
+
+    test_case.wait_completion();
+}
+
+fn generate_msg(allocator: Allocator, size: usize) ![]u8 {
+    var prng: std.Random.DefaultPrng = .init(blk: {
+        var seed: u64 = undefined;
+        try std.posix.getrandom(std.mem.asBytes(&seed));
+        break :blk seed;
+    });
+    const rand = prng.random();
+
+    const buf = try allocator.alloc(u8, size);
+    rand.bytes(buf);
+    return buf;
+}
+
+fn test_large_messages(allocator: Allocator) !void {
+    const addr = get_addr(allocator) catch unreachable;
+
+    const num_clients: usize = 128;
+    var test_case: Test = .init(allocator, addr);
+    try test_case.start(num_clients);
+
+    for (0..num_clients) |_| {
+        const msg = try generate_msg(allocator, 40960);
         var c: Test.Client = .init(msg, msg);
         try c.run(PROXY_ADDR);
         try c.get_response();
