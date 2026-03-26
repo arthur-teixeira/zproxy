@@ -52,7 +52,7 @@ pub fn init(self: *Stream, connfd: i32, state: State) void {
     };
 }
 
-pub fn flush(self: *Stream) void {
+pub fn clear(self: *Stream) void {
     self.buf = @splat(0);
     self.pos = 0;
 }
@@ -82,6 +82,20 @@ pub const Pool = struct {
         self.allocator.free(self.slots);
     }
 
+    pub fn ensure_free_slots(self: *Pool, n: usize) !void {
+        var free: usize = 0;
+        for (self.slots) |slot| {
+            if (!slot.in_use) {
+                free += 1;
+                if (free == n) {
+                    return;
+                }
+            }
+        }
+
+        self.slots = try self.allocator.realloc(self.slots, self.slots.len * 2);
+    }
+
     pub fn reserve(self: *Pool) !Key {
         for (self.slots, 0..) |slot, i| {
             if (!slot.in_use) {
@@ -90,15 +104,12 @@ pub const Pool = struct {
             }
         }
 
-        const last_i = self.slots.len;
-
-        self.slots = try self.allocator.realloc(self.slots, self.slots.len * 2);
-        self.slots[last_i + 1].in_use = true;
-        return @enumFromInt(last_i + 1);
+        return error.Full;
     }
 
     pub fn release(self: *Pool, key: Key) void {
         self.slots[@intFromEnum(key)].in_use = false;
+        self.slots[@intFromEnum(key)].stream.clear();
     }
 
     pub fn get(self: Pool, key: Key) *Stream {

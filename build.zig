@@ -52,11 +52,11 @@ fn run_mock_upstream(b: *std.Build) void {
     up.dependOn(&run.step);
 }
 
-fn build_echo_tester(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+fn build_tests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     const zproxy_exe = b.addExecutable(.{
-        .name = "echo_tester",
+        .name = "tests",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/echo_test.zig"),
+            .root_source_file = b.path("src/tests.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{},
@@ -69,7 +69,7 @@ fn build_echo_tester(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     };
     opts.set(b, zproxy_exe);
 
-    const run_zproxy_step = b.step("echo_test", "Run zproxy Echo tester");
+    const run_zproxy_step = b.step("test", "Run zproxy tests");
     const run_zproxy_cmd = b.addRunArtifact(zproxy_exe);
     run_zproxy_step.dependOn(&run_zproxy_cmd.step);
     run_zproxy_cmd.step.dependOn(b.getInstallStep());
@@ -83,6 +83,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     build_zproxy(b, target, optimize);
-    build_echo_tester(b, target, optimize);
+    build_tests(b, target, optimize);
     run_mock_upstream(b);
 }

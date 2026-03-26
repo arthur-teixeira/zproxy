@@ -7,7 +7,7 @@ const p = @import("./proxy.zig");
 const proxy = p.proxy;
 const opts = @import("build_options");
 
-const MESSAGE_SIZE = 256;
+const MESSAGE_SIZE = 40960;
 const PROXY_ADDR: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
 
 fn get_addr(allocator: Allocator) !net.Address {

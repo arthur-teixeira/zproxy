@@ -55,11 +55,14 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
         for (0..uring.cq_ready()) |_| {
             const cqe = uring.read().?;
             const cqe_key: Stream.Key = @enumFromInt(cqe.user_data);
+            try conn_pool.ensure_free_slots(1);
+            accept_data = conn_pool.get(accept_key);
             const cqe_data: *Stream = conn_pool.get(cqe_key);
 
             switch (cqe_data.state) {
                 .Accept => {
                     const connfd = cqe.res;
+
                     const bytes: *const [4]u8 = @ptrCast(&accept_data.addr.addr);
                     std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port });
 
@@ -72,11 +75,14 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                     uring.prep_recv(conn_key, conn_data);
                 },
                 .Recv => {
+                    if (cqe.err() != .SUCCESS) {
+                        std.debug.print("Error receiving from sockfd: {any}\n", .{cqe.err()});
+                    }
+
                     const nb = cqe.res;
                     if (nb > 0) {
-                        const pos = cqe_data.pos;
                         cqe_data.pos += @intCast(nb);
-                        std.debug.print("READ {d} bytes from sock {d} : {s}\n", .{ nb, cqe_data.fd, cqe_data.buf[pos..cqe_data.pos] });
+                        std.debug.print("READ {d} bytes from sock {d}\n", .{ nb, cqe_data.fd });
                         cqe_data.state = .Send;
                         if (cqe_data.opposing != null) {
                             uring.prep_send(cqe_key, cqe_data, conn_pool.get(cqe_data.opposing.?));
@@ -95,10 +101,6 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                             std.debug.print("Closing reciprocal socket\n", .{});
                             uring.prep_close(opp, conn_pool.get(opp));
                         }
-                    } else {
-                        const err: linux.E = @enumFromInt(-nb);
-                        std.debug.print("ERROR : {any}\n", .{err});
-                        @panic("SHOULD HANDLE ERROR BETTER");
                     }
                 },
                 .Socket => {
@@ -130,7 +132,7 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                         std.debug.print("SENT {d} bytes to sockfd\n", .{cqe.res});
                         assert(cqe_data.opposing != null);
                         cqe_data.state = .Recv;
-                        cqe_data.flush();
+                        cqe_data.clear();
                         const opp_key = cqe_data.opposing.?;
                         uring.prep_recv(opp_key, conn_pool.get(opp_key));
                     }
