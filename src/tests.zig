@@ -44,8 +44,14 @@ fn spawn_server(addr: std.net.Address, comptime num_incoming: usize) !void {
 
     var ts: [num_incoming]std.Thread = undefined;
     while (accepted < num_incoming) : (accepted += 1) {
-        const conn = try server.accept();
-        ts[accepted] = try std.Thread.spawn(.{}, handle_conn, .{conn});
+        const conn = server.accept() catch |err| {
+            std.debug.print("Error accepting connection: {any}\n", .{err});
+            continue;
+        };
+        ts[accepted] = std.Thread.spawn(.{}, handle_conn, .{conn}) catch |err| {
+            std.debug.print("Error spawning connection thread: {any}\n", .{err});
+            continue;
+        };
     }
 
     for (ts) |t| {
@@ -192,7 +198,7 @@ fn test_serial(allocator: Allocator) !void {
 fn test_connection_pool_exhaustion(allocator: Allocator) !void {
     const addr = get_addr(allocator) catch unreachable;
 
-    const num_clients: usize = 128;
+    const num_clients: usize = 5000;
     var test_case: Test = .init(allocator, addr);
     try test_case.start(num_clients);
 
@@ -201,7 +207,7 @@ fn test_connection_pool_exhaustion(allocator: Allocator) !void {
         var c: Test.Client = .init(msg, msg);
         try c.run(PROXY_ADDR);
         try c.get_response();
-        allocator.free(c.req);
+        allocator.free(msg);
     }
 
     test_case.wait_completion();

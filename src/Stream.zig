@@ -67,40 +67,57 @@ pub const Slot = struct {
 };
 
 pub const Pool = struct {
-    slots: []Slot,
+    buckets: std.ArrayList([]Slot),
+    capacity: usize,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, capacity: usize) !Pool {
-        const slots = try allocator.alloc(Slot, capacity);
-        return .{
-            .slots = slots,
+        const slots: std.ArrayList([]Slot) = try .initCapacity(allocator, 1);
+        var p: Pool = .{
+            .buckets = slots,
+            .capacity = capacity,
             .allocator = allocator,
         };
+        try p.alloc_bucket();
+        return p;
+    }
+
+    fn alloc_bucket(self: *Pool) !void {
+        const new_bucket = try self.allocator.alloc(Slot, self.capacity);
+        try self.buckets.append(self.allocator, new_bucket);
     }
 
     pub fn deinit(self: *Pool) void {
-        self.allocator.free(self.slots);
+        for (self.buckets.items) |bucket| {
+            self.allocator.free(bucket);
+        }
+
+        self.buckets.deinit(self.allocator);
+
     }
 
     pub fn ensure_free_slots(self: *Pool, n: usize) !void {
         var free: usize = 0;
-        for (self.slots) |slot| {
-            if (!slot.in_use) {
-                free += 1;
-                if (free == n) {
-                    return;
+        for (self.buckets.items) |bucket| {
+            for (bucket) |slot| {
+                if (!slot.in_use) {
+                    free += 1;
+                    if (free == n) {
+                        return;
+                    }
                 }
             }
         }
-
-        self.slots = try self.allocator.realloc(self.slots, self.slots.len * 2);
+        try self.alloc_bucket();
     }
 
     pub fn reserve(self: *Pool) !Key {
-        for (self.slots, 0..) |slot, i| {
-            if (!slot.in_use) {
-                self.slots[i].in_use = true;
-                return @enumFromInt(i);
+        for (self.buckets.items, 0..) |bucket, i| {
+            for (bucket, 0..) |slot, j| {
+                if (!slot.in_use) {
+                    bucket[j].in_use = true;
+                    return @enumFromInt(i * self.capacity + j);
+                }
             }
         }
 
@@ -108,12 +125,19 @@ pub const Pool = struct {
     }
 
     pub fn release(self: *Pool, key: Key) void {
-        self.slots[@intFromEnum(key)].in_use = false;
-        self.slots[@intFromEnum(key)].stream.clear();
+        const bucket_i = @divTrunc(@intFromEnum(key), self.capacity);
+        const slot_i = @rem(@intFromEnum(key), self.capacity);
+        var bucket = self.buckets.items[bucket_i];
+        bucket[slot_i].in_use = false;
+        bucket[slot_i].stream.clear();
     }
 
     pub fn get(self: Pool, key: Key) *Stream {
-        assert(self.slots[@intFromEnum(key)].in_use);
-        return &self.slots[@intFromEnum(key)].stream;
+        const bucket_i = @divTrunc(@intFromEnum(key), self.capacity);
+        const slot_i = @rem(@intFromEnum(key), self.capacity);
+        var bucket = self.buckets.items[bucket_i];
+        assert(bucket[slot_i].in_use);
+
+        return &bucket[@intFromEnum(key)].stream;
     }
 };

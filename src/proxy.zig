@@ -64,7 +64,7 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                     const connfd = cqe.res;
 
                     const bytes: *const [4]u8 = @ptrCast(&accept_data.addr.addr);
-                    std.debug.print("Got connection from {d}.{d}.{d}.{d}:{d}\n", .{ bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port });
+                    std.debug.print("Got connection {d} from {d}.{d}.{d}.{d}:{d}\n", .{ cqe_data.fd, bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port });
 
                     const conn_key = try conn_pool.reserve();
                     const conn_data = conn_pool.get(conn_key);
@@ -76,7 +76,7 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                 },
                 .Recv => {
                     if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error receiving from sockfd: {any}\n", .{cqe.err()});
+                        std.debug.print("Error receiving from sockfd {d}: {any}\n", .{ cqe_data.fd, cqe.err() });
                     }
 
                     const nb = cqe.res;
@@ -139,6 +139,8 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                 },
                 .Close => {
                     std.debug.print("Connection {d} successfully closed\n", .{cqe_data.fd});
+                    conn_pool.release(cqe_data.opposing.?);
+                    conn_pool.release(cqe_key);
                 },
                 .Cancel => {
                     std.debug.print("Ring cancelled and all operations processed\n", .{});
