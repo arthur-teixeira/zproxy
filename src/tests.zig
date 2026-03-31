@@ -138,24 +138,16 @@ const Test = struct {
     }
 };
 
-pub fn main() !void {
-    var dba = std.heap.DebugAllocator(.{}){};
-    defer _ = dba.deinit();
-    const allocator = dba.allocator();
-
-    try test_concurrent(allocator);
-    try test_serial(allocator);
-    try test_connection_pool_exhaustion(allocator);
-    try test_large_messages(allocator);
-    _ = dba.detectLeaks();
-}
 
 fn run_client(client: *Test.Client) !void {
     try client.run(PROXY_ADDR);
     try client.get_response();
 }
 
-fn test_concurrent(allocator: Allocator) !void {
+test "concurrent connections" {
+    var dba = std.heap.DebugAllocator(.{}){};
+    defer _ = dba.deinit();
+    const allocator = dba.allocator();
     const addr = get_addr(allocator) catch unreachable;
 
     const num_clients: usize = 10;
@@ -177,7 +169,10 @@ fn test_concurrent(allocator: Allocator) !void {
     test_case.wait_completion();
 }
 
-fn test_serial(allocator: Allocator) !void {
+test "serial connections" {
+    var dba = std.heap.DebugAllocator(.{}){};
+    defer _ = dba.deinit();
+    const allocator = dba.allocator();
     const addr = get_addr(allocator) catch unreachable;
 
     const num_clients: usize = 10;
@@ -195,7 +190,10 @@ fn test_serial(allocator: Allocator) !void {
     test_case.wait_completion();
 }
 
-fn test_connection_pool_exhaustion(allocator: Allocator) !void {
+test "connection_pool_exhaustion" {
+    var dba = std.heap.DebugAllocator(.{}){};
+    defer _ = dba.deinit();
+    const allocator = dba.allocator();
     const addr = get_addr(allocator) catch unreachable;
 
     const num_clients: usize = 5000;
@@ -226,7 +224,10 @@ fn generate_msg(allocator: Allocator, size: usize) ![]u8 {
     return buf;
 }
 
-fn test_large_messages(allocator: Allocator) !void {
+test "large_messages" {
+    var dba = std.heap.DebugAllocator(.{}){};
+    defer _ = dba.deinit();
+    const allocator = dba.allocator();
     const addr = get_addr(allocator) catch unreachable;
 
     const num_clients: usize = 128;
