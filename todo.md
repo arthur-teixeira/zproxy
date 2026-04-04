@@ -26,6 +26,3 @@
 - [ ] Fuzz testing somewhere ?
 - [X] E2E testing framework
 - [ ] Perf/Stress testing
-- [ ] Silence stdout/stderr when running test
-- [ ] Report test statuses
-    - [ ] Convert to normal Zig tests

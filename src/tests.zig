@@ -1,3 +1,7 @@
+comptime {
+    _ = @import("config.zig");
+}
+
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
@@ -137,7 +141,6 @@ const Test = struct {
         p.test_sync.mutex.unlock();
     }
 };
-
 
 fn run_client(client: *Test.Client) !void {
     try client.run(PROXY_ADDR);

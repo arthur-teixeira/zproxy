@@ -1,0 +1,14 @@
+{
+  "upstream": [
+    {
+      "name": "server1",
+      "address": "localhost",
+      "port": 8080
+    },
+    {
+      "name": "server2",
+      "address": "localhost",
+      "port": 8081
+    }
+  ]
+}
