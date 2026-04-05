@@ -17,8 +17,8 @@ pub const test_sync = if (builtin.is_test)
 else
     struct {};
 
-fn setup_listener_sock() !i32 {
-    const addr: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
+fn setup_listener_sock(cfg: Config.Value) !i32 {
+    const addr: std.net.Address = .{ .in = std.net.Ip4Address.parse(cfg.proxy.address, cfg.proxy.port) catch unreachable };
 
     const optval: u32 = 1;
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
@@ -44,7 +44,7 @@ fn resolve_upstream_addr(allocator: Allocator, name: []const u8, port: u16) !std
 pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.Value(bool)) !void {
     var uring: Uring = try .init(16);
     defer uring.deinit();
-    const sockfd = try setup_listener_sock();
+    const sockfd = try setup_listener_sock(config);
     defer posix.close(sockfd);
 
     // TODO: multiple upstream addresses

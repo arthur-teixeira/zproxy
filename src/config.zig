@@ -6,6 +6,7 @@ const Config = @This();
 
 pub const Value = struct {
     upstream: []Upstream,
+    proxy: Proxy,
 };
 
 allocator: Allocator,
@@ -15,6 +16,11 @@ pub const Upstream = struct {
     address: []const u8,
     port: ?u16 = null,
     name: []const u8,
+};
+
+pub const Proxy = struct {
+    address: []const u8,
+    port: u16,
 };
 
 pub fn init_from_file(allocator: Allocator, file_path: []const u8) !Config {
