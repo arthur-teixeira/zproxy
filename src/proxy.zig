@@ -1,13 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
-const opts = @import("build_options");
 const posix = std.posix;
 const assert = std.debug.assert;
 const Stream = @import("./Stream.zig");
 const Uring = @import("./Uring.zig");
+const Config = @import("./config.zig");
 
-pub const test_sync = if (opts.testing)
+pub const test_sync = if (builtin.is_test)
     struct {
         pub var cond = std.Thread.Condition{};
         pub var ready = false;
@@ -28,11 +29,31 @@ fn setup_listener_sock() !i32 {
     return sockfd;
 }
 
-pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*std.atomic.Value(bool)) !void {
+fn resolve_upstream_addr(allocator: Allocator, name: []const u8, port: u16) !std.net.Address {
+    const list = try std.net.getAddressList(allocator, name, port);
+    defer list.deinit();
+    for (list.addrs) |addr| {
+        if (addr.any.family == posix.AF.INET6) continue;
+        return addr;
+    }
+
+    if (list.addrs.len > 0) return error.Ipv6NotSupported;
+    return error.InvalidHostname;
+}
+
+pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.Value(bool)) !void {
     var uring: Uring = try .init(16);
     defer uring.deinit();
     const sockfd = try setup_listener_sock();
     defer posix.close(sockfd);
+
+    // TODO: multiple upstream addresses
+    assert(config.upstream.len > 0);
+    assert(config.upstream[0].port != null);
+
+    std.debug.print("Starting proxy with upstream {s}:{d}\n", .{ config.upstream[0].address, config.upstream[0].port.? });
+
+    const upstream_addr = try resolve_upstream_addr(allocator, config.upstream[0].address, config.upstream[0].port.?);
 
     var conn_pool = try Stream.Pool.init(allocator, 32);
     defer conn_pool.deinit();
@@ -46,7 +67,7 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
     while (true) {
         const nflushed = uring.flush_sq();
         _ = try uring.submit_and_wait(nflushed, 0);
-        if (opts.testing and !test_sync.ready) {
+        if (builtin.is_test and !test_sync.ready) {
             test_sync.mutex.lock();
             test_sync.ready = true;
             test_sync.mutex.unlock();
@@ -85,6 +106,7 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                         std.debug.print("READ {d} bytes from sock {d}\n", .{ nb, cqe_data.fd });
                         cqe_data.state = .Send;
                         if (cqe_data.opposing != null) {
+                            assert(cqe_data.opposing.? != cqe_key);
                             uring.prep_send(cqe_key, cqe_data, conn_pool.get(cqe_data.opposing.?));
                         } else {
                             const opposing = try conn_pool.reserve();
@@ -115,6 +137,7 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                 .Connect => {
                     assert(cqe_data.opposing != null);
                     const opp_key = cqe_data.opposing.?;
+                    assert(opp_key != cqe_key);
                     const opposing = conn_pool.get(opp_key);
                     if (cqe.err() != .SUCCESS) {
                         std.debug.print("Error Connecting to upstream: {any}\n", .{cqe.err()});
@@ -131,6 +154,7 @@ pub fn proxy(allocator: Allocator, upstream_addr: std.net.Address, running: ?*st
                     } else {
                         std.debug.print("SENT {d} bytes to sockfd\n", .{cqe.res});
                         assert(cqe_data.opposing != null);
+                        assert(cqe_data.opposing.? != cqe_key);
                         cqe_data.state = .Recv;
                         cqe_data.clear();
                         const opp_key = cqe_data.opposing.?;

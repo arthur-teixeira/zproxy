@@ -7,15 +7,19 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const net = std.net;
 const assert = std.debug.assert;
+const Config = @import("./config.zig");
 const p = @import("./proxy.zig");
 const proxy = p.proxy;
-const opts = @import("build_options");
 
 const MESSAGE_SIZE = 40960;
 const PROXY_ADDR: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1", 8080) catch unreachable };
 
-fn get_addr(allocator: Allocator) !net.Address {
-    const list = try std.net.getAddressList(allocator, "localhost", 3030);
+fn get_addr(allocator: Allocator, cfg: Config.Value) !net.Address {
+    // TODO: multiple upstreams
+    assert(cfg.upstream.len == 1);
+    assert(cfg.upstream[0].port != null);
+
+    const list = try std.net.getAddressList(allocator, cfg.upstream[0].address, cfg.upstream[0].port.?);
     defer list.deinit();
     for (list.addrs) |addr| {
         if (addr.any.family == posix.AF.INET6) continue;
@@ -23,6 +27,20 @@ fn get_addr(allocator: Allocator) !net.Address {
     }
     if (list.addrs.len > 0) return error.Ipv6NotSupported;
     return error.InvalidHostname;
+}
+
+const default_upstreams = [_]Config.Upstream{
+    .{
+        .address = "localhost",
+        .port = 3030,
+        .name = "server1",
+    },
+};
+
+fn default_cfg() Config.Value {
+    return .{
+        .upstream = @constCast(&default_upstreams),
+    };
 }
 
 fn handle_conn(conn: net.Server.Connection) !void {
@@ -40,7 +58,8 @@ fn handle_conn(conn: net.Server.Connection) !void {
     }
 }
 
-fn spawn_server(addr: std.net.Address, comptime num_incoming: usize) !void {
+fn spawn_server(allocator: Allocator, cfg: Config.Value, comptime num_incoming: usize) !void {
+    const addr = try get_addr(allocator, cfg);
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.deinit();
 
@@ -66,7 +85,7 @@ fn spawn_server(addr: std.net.Address, comptime num_incoming: usize) !void {
 const Test = struct {
     allocator: Allocator,
     server_thread: std.Thread,
-    server_addr: std.net.Address,
+    cfg: Config.Value,
     proxy_thread: std.Thread,
     proxy_signal: std.atomic.Value(bool),
 
@@ -108,19 +127,19 @@ const Test = struct {
         }
     };
 
-    fn init(allocator: Allocator, server_addr: std.net.Address) Test {
+    fn init(allocator: Allocator, cfg: Config.Value) Test {
         return .{
             .allocator = allocator,
             .proxy_signal = .init(true),
-            .server_addr = server_addr,
+            .cfg = cfg,
             .server_thread = undefined,
             .proxy_thread = undefined,
         };
     }
 
     fn start(self: *Test, comptime num_clients: usize) !void {
-        self.server_thread = try std.Thread.spawn(.{}, spawn_server, .{ self.server_addr, num_clients });
-        self.proxy_thread = try std.Thread.spawn(.{}, proxy, .{ self.allocator, self.server_addr, &self.proxy_signal });
+        self.server_thread = try std.Thread.spawn(.{}, spawn_server, .{ self.allocator, self.cfg, num_clients });
+        self.proxy_thread = try std.Thread.spawn(.{}, proxy, .{ self.allocator, self.cfg, &self.proxy_signal });
         self.wait_proxy();
     }
 
@@ -148,13 +167,13 @@ fn run_client(client: *Test.Client) !void {
 }
 
 test "concurrent connections" {
+    std.testing.log_level = .debug;
+    std.log.debug("Spawning {d} clients\n", .{10});
     var dba = std.heap.DebugAllocator(.{}){};
     defer _ = dba.deinit();
     const allocator = dba.allocator();
-    const addr = get_addr(allocator) catch unreachable;
-
     const num_clients: usize = 10;
-    var test_case: Test = .init(allocator, addr);
+    var test_case: Test = .init(allocator, default_cfg());
     try test_case.start(num_clients);
 
     var clients: [num_clients]Test.Client = undefined;
@@ -176,10 +195,9 @@ test "serial connections" {
     var dba = std.heap.DebugAllocator(.{}){};
     defer _ = dba.deinit();
     const allocator = dba.allocator();
-    const addr = get_addr(allocator) catch unreachable;
 
     const num_clients: usize = 10;
-    var test_case: Test = .init(allocator, addr);
+    var test_case: Test = .init(allocator, default_cfg());
     try test_case.start(num_clients);
 
     for (0..num_clients) |i| {
@@ -197,10 +215,9 @@ test "connection_pool_exhaustion" {
     var dba = std.heap.DebugAllocator(.{}){};
     defer _ = dba.deinit();
     const allocator = dba.allocator();
-    const addr = get_addr(allocator) catch unreachable;
 
     const num_clients: usize = 5000;
-    var test_case: Test = .init(allocator, addr);
+    var test_case: Test = .init(allocator, default_cfg());
     try test_case.start(num_clients);
 
     for (0..num_clients) |i| {
@@ -231,10 +248,9 @@ test "large_messages" {
     var dba = std.heap.DebugAllocator(.{}){};
     defer _ = dba.deinit();
     const allocator = dba.allocator();
-    const addr = get_addr(allocator) catch unreachable;
 
     const num_clients: usize = 128;
-    var test_case: Test = .init(allocator, addr);
+    var test_case: Test = .init(allocator, default_cfg());
     try test_case.start(num_clients);
 
     for (0..num_clients) |_| {

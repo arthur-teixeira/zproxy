@@ -138,6 +138,6 @@ pub const Pool = struct {
         var bucket = self.buckets.items[bucket_i];
         assert(bucket[slot_i].in_use);
 
-        return &bucket[@intFromEnum(key)].stream;
+        return &bucket[slot_i].stream;
     }
 };

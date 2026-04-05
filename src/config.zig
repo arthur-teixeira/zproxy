@@ -4,16 +4,16 @@ const json = std.json;
 
 const Config = @This();
 
-const Value = struct {
+pub const Value = struct {
     upstream: []Upstream,
 };
 
 allocator: Allocator,
 parsed: json.Parsed(Value),
 
-const Upstream = struct {
+pub const Upstream = struct {
     address: []const u8,
-    port: ?u32 = null,
+    port: ?u16 = null,
     name: []const u8,
 };
 
@@ -28,7 +28,7 @@ pub fn init_from_file(allocator: Allocator, file_path: []const u8) !Config {
 }
 
 fn from_json(allocator: Allocator, json_string: []const u8) !Config {
-    const p = try json.parseFromSlice(Config.Value, allocator, json_string, .{});
+    const p = try json.parseFromSlice(Config.Value, allocator, json_string, .{ .allocate = .alloc_always });
 
     return .{
         .allocator = allocator,
@@ -36,11 +36,11 @@ fn from_json(allocator: Allocator, json_string: []const u8) !Config {
     };
 }
 
-fn deinit(self: *Config) void {
+pub fn deinit(self: *Config) void {
     self.parsed.deinit();
 }
 
-fn value(self: *Config) Config.Value {
+pub fn value(self: Config) Config.Value {
     return self.parsed.value;
 }
 
@@ -64,4 +64,7 @@ test "parse file" {
     try std.testing.expectEqualDeep(Config.Value{
         .upstream = &upstreams,
     }, config.value());
+
+    try std.testing.expectEqualStrings("localhost", config.parsed.value.upstream[0].address);
+    try std.testing.expectEqualStrings("localhost", config.parsed.value.upstream[1].address);
 }
