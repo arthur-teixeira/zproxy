@@ -14,7 +14,7 @@ parsed: json.Parsed(Value),
 
 pub const Upstream = struct {
     address: []const u8,
-    port: ?u16 = null,
+    port: u16,
     name: []const u8,
 };
 
@@ -46,7 +46,7 @@ pub fn deinit(self: *Config) void {
     self.parsed.deinit();
 }
 
-pub fn value(self: Config) Config.Value {
+pub inline fn value(self: Config) Config.Value {
     return self.parsed.value;
 }
 
@@ -59,17 +59,18 @@ test "parse file" {
     defer config.deinit();
     var upstreams = [_]Upstream{ .{
         .address = "localhost",
-        .port = 8080,
+        .port = 3030,
         .name = "server1",
     }, .{
         .address = "localhost",
-        .port = 8081,
+        .port = 3031,
         .name = "server2",
     } };
 
-    try std.testing.expectEqualDeep(Config.Value{
-        .upstream = &upstreams,
-    }, config.value());
+    try std.testing.expectEqualDeep(Config.Value{ .upstream = &upstreams, .proxy = .{
+        .address = "127.0.0.1",
+        .port = 8080,
+    } }, config.value());
 
     try std.testing.expectEqualStrings("localhost", config.parsed.value.upstream[0].address);
     try std.testing.expectEqualStrings("localhost", config.parsed.value.upstream[1].address);

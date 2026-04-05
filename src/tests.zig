@@ -17,9 +17,8 @@ const PROXY_ADDR: std.net.Address = .{ .in = std.net.Ip4Address.parse("127.0.0.1
 fn get_addr(allocator: Allocator, cfg: Config.Value) !net.Address {
     // TODO: multiple upstreams
     assert(cfg.upstream.len == 1);
-    assert(cfg.upstream[0].port != null);
 
-    const list = try std.net.getAddressList(allocator, cfg.upstream[0].address, cfg.upstream[0].port.?);
+    const list = try std.net.getAddressList(allocator, cfg.upstream[0].address, cfg.upstream[0].port);
     defer list.deinit();
     for (list.addrs) |addr| {
         if (addr.any.family == posix.AF.INET6) continue;
@@ -40,6 +39,10 @@ const default_upstreams = [_]Config.Upstream{
 fn default_cfg() Config.Value {
     return .{
         .upstream = @constCast(&default_upstreams),
+        .proxy = .{
+            .address = "127.0.0.1",
+            .port = 8080,
+        },
     };
 }
 

@@ -21,16 +21,6 @@ fn build_zproxy(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     }
 }
 
-fn run_mock_upstream(b: *std.Build) void {
-    const up = b.step("mock", "Run ncat mock upstream");
-    const run = b.addSystemCommand(&[_][]const u8{
-        "sh",
-        "-c",
-        "ncat -k -l 3030 -c 'cat | tee /dev/tty'",
-    });
-    up.dependOn(&run.step);
-}
-
 fn build_tests(b: *std.Build, target: std.Build.ResolvedTarget) void {
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -51,5 +41,4 @@ pub fn build(b: *std.Build) void {
 
     build_zproxy(b, target, optimize);
     build_tests(b, target);
-    run_mock_upstream(b);
 }

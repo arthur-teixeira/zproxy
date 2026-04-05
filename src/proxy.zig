@@ -29,16 +29,27 @@ fn setup_listener_sock(cfg: Config.Value) !i32 {
     return sockfd;
 }
 
-fn resolve_upstream_addr(allocator: Allocator, name: []const u8, port: u16) !std.net.Address {
-    const list = try std.net.getAddressList(allocator, name, port);
-    defer list.deinit();
-    for (list.addrs) |addr| {
-        if (addr.any.family == posix.AF.INET6) continue;
-        return addr;
+fn resolve_upstreams(allocator: Allocator, config: Config.Value) ![]std.net.Address {
+    var addresses = try allocator.alloc(std.net.Address, config.upstream.len);
+    for (config.upstream, 0..) |u, i| {
+        const list = try std.net.getAddressList(allocator, u.address, u.port);
+        defer list.deinit();
+        var found = false;
+        for (list.addrs) |addr| {
+            if (addr.any.family == posix.AF.INET6) continue;
+            addresses[i] = addr;
+            found = true;
+            break;
+        }
+        if (list.addrs.len > 0 and !found) return error.Ipv6NotSupported;
     }
 
-    if (list.addrs.len > 0) return error.Ipv6NotSupported;
-    return error.InvalidHostname;
+    return addresses;
+}
+
+fn select_upstream(connection_counter: usize, addresses: []std.net.Address) std.net.Address {
+    const i = connection_counter % addresses.len;
+    return addresses[i];
 }
 
 pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.Value(bool)) !void {
@@ -47,13 +58,9 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
     const sockfd = try setup_listener_sock(config);
     defer posix.close(sockfd);
 
-    // TODO: multiple upstream addresses
-    assert(config.upstream.len > 0);
-    assert(config.upstream[0].port != null);
-
-    std.debug.print("Starting proxy with upstream {s}:{d}\n", .{ config.upstream[0].address, config.upstream[0].port.? });
-
-    const upstream_addr = try resolve_upstream_addr(allocator, config.upstream[0].address, config.upstream[0].port.?);
+    var connection_counter: usize = 0;
+    const upstream_addrs = try resolve_upstreams(allocator, config);
+    defer allocator.free(upstream_addrs);
 
     var conn_pool = try Stream.Pool.init(allocator, 32);
     defer conn_pool.deinit();
@@ -129,8 +136,10 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                     std.debug.print("Created socket {d}\n", .{cqe.res});
                     assert(cqe_data.opposing != null);
                     cqe_data.fd = cqe.res;
-                    cqe_data.addr = upstream_addr.in.sa;
-                    cqe_data.addrlen = upstream_addr.getOsSockLen();
+                    const addr = select_upstream(connection_counter, upstream_addrs);
+                    cqe_data.addr = addr.in.sa;
+                    cqe_data.addrlen = addr.getOsSockLen();
+                    connection_counter += 1;
                     assert(cqe.res > 0); // TODO: handle errors
                     uring.prep_connect(cqe_key, cqe_data);
                 },
