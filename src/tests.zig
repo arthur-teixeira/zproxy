@@ -20,12 +20,8 @@ fn get_addr(allocator: Allocator, cfg: Config.Value) !net.Address {
 
     const list = try std.net.getAddressList(allocator, cfg.upstream[0].address, cfg.upstream[0].port);
     defer list.deinit();
-    for (list.addrs) |addr| {
-        if (addr.any.family == posix.AF.INET6) continue;
-        return addr;
-    }
-    if (list.addrs.len > 0) return error.Ipv6NotSupported;
-    return error.InvalidHostname;
+    if (list.addrs.len == 0) return error.InvalidHostname;
+    return list.addrs[0];
 }
 
 const default_upstreams = [_]Config.Upstream{

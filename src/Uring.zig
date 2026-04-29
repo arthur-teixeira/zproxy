@@ -132,11 +132,6 @@ pub fn init(size: u32) !Uring {
 
 pub fn deinit(self: *Uring) void {
     posix.close(self.fd);
-    // self.sq.sqes;
-    // self.sq.sqes;
-    // if (self.single_mmap) {
-    //
-    // }
 }
 
 pub inline fn get_sqe(self: *Uring) *linux.io_uring_sqe {
@@ -180,14 +175,14 @@ pub fn prep_socket(self: *Uring, key: Stream.Key, data: *Stream) void {
     assert(data.fd == 0);
     var sqe = self.get_sqe();
     data.state = .Socket;
-    sqe.prep_socket(linux.AF.INET, linux.SOCK.STREAM, 0, 0);
+    const sa: *const linux.sockaddr = @ptrCast(&data.addr);
+    sqe.prep_socket(sa.family, linux.SOCK.STREAM, 0, 0);
     sqe.user_data = @intFromEnum(key);
 }
 
 pub fn prep_connect(self: *Uring, key: Stream.Key, data: *Stream) void {
     assert(data.state == .Socket);
     assert(data.fd > 0);
-    assert(data.addr.family == linux.AF.INET);
     var sqe = self.get_sqe();
     data.state = .Connect;
     sqe.prep_connect(data.fd, @ptrCast(&data.addr), data.addrlen);

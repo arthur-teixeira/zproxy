@@ -18,11 +18,15 @@ else
     struct {};
 
 fn setup_listener_sock(cfg: Config.Value) !i32 {
-    const addr: std.net.Address = .{ .in = std.net.Ip4Address.parse(cfg.proxy.address, cfg.proxy.port) catch unreachable };
+    const addr: std.net.Address = try std.net.Address.resolveIp(cfg.proxy.address, cfg.proxy.port);
 
-    const optval: u32 = 1;
-    const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var optval: u32 = 1;
+    const sockfd = try posix.socket(addr.any.family, posix.SOCK.STREAM, 0);
+    if (addr.any.family == posix.AF.INET6) {
+        try posix.setsockopt(sockfd, posix.IPPROTO.IPV6, linux.IPV6.V6ONLY, std.mem.asBytes(&optval));
+    }
     try posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&optval));
+    optval = 0;
     try posix.bind(sockfd, &addr.any, addr.getOsSockLen());
     try posix.listen(sockfd, 50);
 
@@ -34,14 +38,11 @@ fn resolve_upstreams(allocator: Allocator, config: Config.Value) ![]std.net.Addr
     for (config.upstream, 0..) |u, i| {
         const list = try std.net.getAddressList(allocator, u.address, u.port);
         defer list.deinit();
-        var found = false;
-        for (list.addrs) |addr| {
-            if (addr.any.family == posix.AF.INET6) continue;
-            addresses[i] = addr;
-            found = true;
-            break;
+
+        if (list.addrs.len == 0) {
+            return error.NoUpstreamAddresses;
         }
-        if (list.addrs.len > 0 and !found) return error.Ipv6NotSupported;
+        addresses[i] = list.addrs[0];
     }
 
     return addresses;
@@ -91,8 +92,8 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                 .Accept => {
                     const connfd = cqe.res;
 
-                    const bytes: *const [4]u8 = @ptrCast(&accept_data.addr.addr);
-                    std.debug.print("Got connection {d} from {d}.{d}.{d}.{d}:{d}\n", .{ cqe_data.fd, bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port });
+                    // const bytes: *const [4]u8 = @ptrCast(&accept_data.addr.data);
+                    // std.debug.print("Got connection {d} from {d}.{d}.{d}.{d}:{d}\n", .{ cqe_data.fd, bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port });
 
                     const conn_key = try conn_pool.reserve();
                     const conn_data = conn_pool.get(conn_key);
@@ -116,10 +117,15 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                             assert(cqe_data.opposing.? != cqe_key);
                             uring.prep_send(cqe_key, cqe_data, conn_pool.get(cqe_data.opposing.?));
                         } else {
+                            const addr = select_upstream(connection_counter, upstream_addrs);
                             const opposing = try conn_pool.reserve();
                             const opposing_socket = conn_pool.get(opposing);
                             opposing_socket.init(0, .Socket);
+                            const n = addr.getOsSockLen();
+                            @memcpy(std.mem.asBytes(&opposing_socket.addr)[0..n], std.mem.asBytes(&addr)[0..n]);
+                            opposing_socket.addrlen = addr.getOsSockLen();
                             opposing_socket.opposing = cqe_key;
+
                             cqe_data.opposing = opposing;
                             uring.prep_socket(opposing, opposing_socket);
                         }
@@ -136,14 +142,12 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                     std.debug.print("Created socket {d}\n", .{cqe.res});
                     assert(cqe_data.opposing != null);
                     cqe_data.fd = cqe.res;
-                    const addr = select_upstream(connection_counter, upstream_addrs);
-                    cqe_data.addr = addr.in.sa;
-                    cqe_data.addrlen = addr.getOsSockLen();
                     connection_counter += 1;
                     assert(cqe.res > 0); // TODO: handle errors
                     uring.prep_connect(cqe_key, cqe_data);
                 },
                 .Connect => {
+                    std.debug.print("Socket connected\n", .{});
                     assert(cqe_data.opposing != null);
                     const opp_key = cqe_data.opposing.?;
                     assert(opp_key != cqe_key);
