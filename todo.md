@@ -8,8 +8,6 @@
     - [X] create objects inside an object pool and replace all pointers with indices into the pool
 - [X] Configure multiple upstreams for load balancing
 - [X] Ipv6 support
-- [ ] Upstream connection pool — reuse keepalive connections to upstreams instead of opening a new socket per downstream request; enqueue requests against a fixed pool of persistent upstream sockets
-    - [ ] Use direct descriptors (IORING_REGISTER_FILES) for the upstream socket pool to avoid file table lookups
 
 ## Correctness
 - [ ] Full-duplex streaming — current flow is half-duplex (recv downstream → send upstream → recv upstream → send downstream); splice both directions simultaneously
@@ -24,7 +22,7 @@
 ## Observability
 - [ ] Structured logging — replace std.debug.print with leveled, machine-readable log output (JSON or logfmt)
 - [ ] Access log — one line per connection: timestamp, client IP, upstream, bytes transferred, duration, error
-- [ ] Metrics — active connections, bytes in/out, error counts, latency histograms; expose Prometheus /metrics on a separate port
+- [ ] Metrics — active connections, bytes in/out, error counts, latency histograms;
 
 ## Security
 - [ ] TLS termination — integrate bearssl or mbedtls to sit in front of TLS backends

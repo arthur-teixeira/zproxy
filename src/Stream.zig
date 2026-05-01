@@ -1,6 +1,6 @@
 const std = @import("std");
 const linux = std.os.linux;
-const posix = std.os.posix;
+const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -22,10 +22,11 @@ const assert = std.debug.assert;
 //                                  ------------------------------------------------------------
 pub const State = enum {
     Accept,
-    Recv,
     Socket,
     Connect,
-    Send,
+    Read,
+    Write,
+    Shutdown,
     Close,
     Cancel,
 };
@@ -35,14 +36,16 @@ const Stream = @This();
 state: State,
 opposing: ?Key,
 addr: linux.sockaddr.storage,
+pipefds: [2]i32,
 fd: i32,
 addrlen: linux.socklen_t,
 buf: [4096]u8,
 pos: u32,
 
-pub fn init(self: *Stream, connfd: i32, state: State) void {
+pub fn init(self: *Stream, connfd: i32, state: State) !void {
     self.* = .{
         .state = state,
+        .pipefds = try posix.pipe(),
         .pos = 0,
         .buf = @splat(0),
         .addr = std.mem.zeroes(linux.sockaddr.storage),
@@ -93,7 +96,6 @@ pub const Pool = struct {
         }
 
         self.buckets.deinit(self.allocator);
-
     }
 
     pub fn ensure_free_slots(self: *Pool, n: usize) !void {
@@ -132,12 +134,13 @@ pub const Pool = struct {
         bucket[slot_i].stream.clear();
     }
 
-    pub fn get(self: Pool, key: Key) *Stream {
+    pub fn get(self: Pool, key: Key) ?*Stream {
         const bucket_i = @divTrunc(@intFromEnum(key), self.capacity);
         const slot_i = @rem(@intFromEnum(key), self.capacity);
         var bucket = self.buckets.items[bucket_i];
-        assert(bucket[slot_i].in_use);
-
+        if (!bucket[slot_i].in_use) {
+            return null;
+        }
         return &bucket[slot_i].stream;
     }
 };
