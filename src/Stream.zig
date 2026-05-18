@@ -114,6 +114,7 @@ pub const Pool = struct {
     }
 
     pub fn reserve(self: *Pool) !Key {
+        try self.ensure_free_slots(10);
         for (self.buckets.items, 0..) |bucket, i| {
             for (bucket, 0..) |slot, j| {
                 if (!slot.in_use) {

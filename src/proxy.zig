@@ -63,7 +63,7 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
     const upstream_addrs = try resolve_upstreams(allocator, config);
     defer allocator.free(upstream_addrs);
 
-    var conn_pool = try Stream.Pool.init(allocator, 32);
+    var conn_pool = try Stream.Pool.init(allocator, 4096);
     defer conn_pool.deinit();
 
     const accept_key = try conn_pool.reserve();
