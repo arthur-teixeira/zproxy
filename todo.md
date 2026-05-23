@@ -10,9 +10,8 @@
 - [X] Ipv6 support
 
 ## Correctness
-- [ ] Full-duplex streaming — current flow is half-duplex (recv downstream → send upstream → recv upstream → send downstream); splice both directions simultaneously
+- [X] Full-duplex streaming — current flow is half-duplex (recv downstream → send upstream → recv upstream → send downstream); splice both directions simultaneously
 - [ ] Fix memory leak in Uring.deinit — mmap regions (sq ring, cq ring, sqes) are never munmap'd
-- [ ] Replace assert(cqe.res > 0) in Socket handler with real error handling
 
 ## Reliability
 - [ ] Upstream health checks — periodic TCP probes to remove downed backends from rotation
@@ -35,7 +34,7 @@
 - [ ] Weighted upstreams and additional LB strategies (least-connections, IP-hash for sticky sessions)
 
 ## Performance
-- [ ] Zero-copy forwarding with IORING_OP_SPLICE — move data between sockets through a kernel pipe, never touching userspace buffers
+- [X] Zero-copy forwarding with IORING_OP_SPLICE — move data between sockets through a kernel pipe, never touching userspace buffers
 - [ ] O(1) free-list in Pool — replace linear scan in reserve() and ensure_free_slots() with an intrusive free-list stack
 - [ ] Cache-align hot Stream fields — pack state, opposing, fd into the first cache line
 - [ ] SQ polling (IORING_SETUP_SQPOLL) — dedicated kernel thread polls SQ, eliminating io_uring_enter syscalls at the cost of one spinning core
