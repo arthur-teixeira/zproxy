@@ -28,7 +28,7 @@ fn setup_listener_sock(cfg: Config.Value) !i32 {
     try posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&optval));
     optval = 0;
     try posix.bind(sockfd, &addr.any, addr.getOsSockLen());
-    try posix.listen(sockfd, 50);
+    try posix.listen(sockfd, 1024);
 
     return sockfd;
 }
@@ -54,7 +54,7 @@ fn select_upstream(connection_counter: usize, addresses: []std.net.Address) std.
 }
 
 pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.Value(bool)) !void {
-    var uring: Uring = try .init(16);
+    var uring: Uring = try .init(256);
     defer uring.deinit();
     const sockfd = try setup_listener_sock(config);
     defer posix.close(sockfd);
@@ -74,7 +74,7 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
 
     while (true) {
         const nflushed = uring.flush_sq();
-        _ = try uring.submit_and_wait(nflushed, 0);
+        _ = try uring.submit_and_wait(nflushed, 1);
         if (builtin.is_test and !test_sync.ready) {
             test_sync.mutex.lock();
             test_sync.ready = true;
@@ -89,7 +89,6 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
             accept_data = conn_pool.get(accept_key).?;
             const cqe_ptr = conn_pool.get(cqe_key);
             if (cqe_ptr == null) {
-                std.debug.print("Stale CQE, ignoring\n", .{});
                 continue;
             }
             const cqe_data = cqe_ptr.?;
@@ -97,11 +96,9 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
             switch (completion.op) {
                 .Accept => {
                     if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error accepting connection: {any}\n", .{cqe.err()});
                         continue;
                     }
                     const connfd = cqe.res;
-                    std.debug.print("Got connection {d} from {d}\n", .{ cqe_data.fd, connfd });
                     const conn_key = try conn_pool.reserve();
                     const conn_data = conn_pool.get(conn_key).?;
                     try conn_data.init(connfd, .Read);
@@ -124,43 +121,33 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                 },
                 .Socket => {
                     if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error Creating socket: {any}\n", .{cqe.err()});
                         continue;
                     }
 
-                    std.debug.print("Created socket {d}\n", .{cqe.res});
                     assert(cqe_data.opposing != null);
                     cqe_data.fd = cqe.res;
                     connection_counter += 1;
                     uring.prep_connect(cqe_key, cqe_data);
                 },
                 .Shutdown => {
-                    std.debug.print("Socket shutdown successfully\n", .{});
                     uring.prep_close(cqe_key, cqe_data);
                 },
                 .Connect => {
-                    std.debug.print("Socket connected\n", .{});
-
                     assert(cqe_data.opposing != null);
                     const opp_key = cqe_data.opposing.?;
                     assert(opp_key != cqe_key);
                     const opposing = conn_pool.get(opp_key).?;
 
                     if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error Connecting to upstream: {any}\n", .{cqe.err()});
                         // TODO: retry with different upstream if available
                         uring.prep_shutdown(opp_key, opposing);
                         continue;
                     }
 
-                    std.debug.print("Connected to upstream on socket {d}: response {d}\n", .{ cqe_data.fd, cqe.res });
-
                     cqe_data.state = .Read;
-                    std.debug.print("Starting splice from socket {d} with pipe {any}\n", .{ cqe_data.fd, cqe_data.pipefds });
                     uring.prep_splice_read(cqe_key, cqe_data);
 
                     opposing.state = .Read;
-                    std.debug.print("Starting splice from socket {d} with pipe {any}\n", .{ opposing.fd, opposing.pipefds });
                     uring.prep_splice_read(opp_key, opposing);
                 },
                 .Read => {
@@ -168,17 +155,14 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                         continue;
                     }
                     if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error reading data on socket {d} with pipe {any}: {any}\n", .{ cqe_data.fd, cqe_data.pipefds, cqe.err() });
                         uring.prep_shutdown(cqe_key, cqe_data);
                         continue;
                     }
-                    std.debug.print("Splice data successfully read on socket {d} with pipe {any}\n", .{ cqe_data.fd, cqe_data.pipefds });
                     const opp_key = cqe_data.opposing.?;
                     assert(opp_key != cqe_key);
                     const opposing = conn_pool.get(opp_key).?;
 
                     if (cqe.res == 0) {
-                        std.debug.print("Socket closed connection, closing sockets {d} and {d}\n", .{ cqe_data.fd, opposing.fd });
                         uring.prep_shutdown(cqe_key, cqe_data);
                         uring.prep_shutdown(opp_key, opposing);
                         continue;
@@ -191,19 +175,15 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                         continue;
                     }
                     if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error transfering data on socket {d} with pipe {any}: {any}\n", .{ cqe_data.fd, cqe_data.pipefds, cqe.err() });
                         uring.prep_shutdown(cqe_key, cqe_data);
                         continue;
                     }
-                    std.debug.print("Splice transfer with {d} bytes \n", .{cqe.res});
                     uring.prep_splice_read(cqe_key, cqe_data);
                 },
                 .Close => {
-                    std.debug.print("Connection {d} successfully closed\n", .{cqe_data.fd});
                     conn_pool.release(cqe_key);
                 },
                 .Cancel => {
-                    std.debug.print("Ring cancelled and all operations processed\n", .{});
                     return;
                 },
             }
@@ -211,7 +191,6 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
 
         if (running) |v| {
             if (!v.load(.monotonic) and accept_data.state != .Cancel) {
-                std.debug.print("Got an interrupt signal, cancelling the ring\n", .{});
                 accept_data.state = .Cancel;
                 try uring.prep_cancel(accept_key);
             }

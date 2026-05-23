@@ -1,17 +1,17 @@
 {
   "proxy": {
-    "address": "127.0.0.1",
-    "port": 8080
+    "address": "0.0.0.0",
+    "port": 9999
   },
   "upstream": [
     {
       "name": "server1",
-      "address": "localhost",
+      "address": "api1",
       "port": 3030
     },
     {
       "name": "server2",
-      "address": "localhost",
+      "address": "api2",
       "port": 3031
     }
   ]
