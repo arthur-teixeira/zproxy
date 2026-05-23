@@ -11,11 +11,6 @@ sq: Sq,
 cq: Cq,
 single_mmap: bool,
 
-pub const Completion = struct {
-    key: Stream.Key,
-    op: Stream.State,
-};
-
 const Sq = struct {
     sq_tail: u32,
     sq_head: u32,
@@ -146,37 +141,19 @@ pub inline fn get_sqe(self: *Uring) *linux.io_uring_sqe {
     return sqe;
 }
 
-fn pack_user_data(key: Stream.Key, state: Stream.State) u64 {
-    return (@intFromEnum(key) << 8) | @intFromEnum(state);
-}
-
-pub fn unpack_user_data(user_data: u64) Completion {
-    return .{
-        .key = @enumFromInt(user_data >> 8),
-        .op = @enumFromInt(user_data & 0xff),
-    };
-}
-
 pub fn prep_multishot_accept(self: *Uring, key: Stream.Key, data: *Stream) void {
     assert(data.state == .Accept);
     var sqe = self.get_sqe();
     sqe.prep_multishot_accept(data.fd, @ptrCast(&data.addr), &data.addrlen, 0);
-    sqe.user_data = pack_user_data(key, .Accept);
+    sqe.user_data = @intFromEnum(key);
 }
 
 pub fn prep_cancel(self: *Uring, key: Stream.Key) !void {
     var sqe = self.get_sqe();
     sqe.* = std.mem.zeroes(linux.io_uring_sqe);
     sqe.opcode = .ASYNC_CANCEL;
-    sqe.addr = pack_user_data(key, .Accept);
-    sqe.user_data = pack_user_data(key, .Cancel);
-}
-
-pub fn prep_shutdown(self: *Uring, key: Stream.Key, data: *Stream) void {
-    var sqe = self.get_sqe();
-    data.state = .Shutdown;
-    sqe.prep_shutdown(data.fd, posix.SHUT.RDWR);
-    sqe.user_data = pack_user_data(key, .Shutdown);
+    sqe.addr = @intFromEnum(key);
+    sqe.user_data = @intFromEnum(key);
 }
 
 pub fn prep_close(self: *Uring, key: Stream.Key, data: *Stream) void {
@@ -184,7 +161,14 @@ pub fn prep_close(self: *Uring, key: Stream.Key, data: *Stream) void {
     data.state = .Close;
     var sqe = self.get_sqe();
     sqe.prep_close(data.fd);
-    sqe.user_data = pack_user_data(key, .Close);
+    sqe.user_data = @intFromEnum(key);
+}
+
+pub fn prep_recv(self: *Uring, key: Stream.Key, data: *Stream) void {
+    data.state = .Recv;
+    var sqe = self.get_sqe();
+    sqe.prep_recv(data.fd, &data.buf, data.pos);
+    sqe.user_data = @intFromEnum(key);
 }
 
 pub fn prep_socket(self: *Uring, key: Stream.Key, data: *Stream) void {
@@ -193,7 +177,7 @@ pub fn prep_socket(self: *Uring, key: Stream.Key, data: *Stream) void {
     data.state = .Socket;
     const sa: *const linux.sockaddr = @ptrCast(&data.addr);
     sqe.prep_socket(sa.family, linux.SOCK.STREAM, 0, 0);
-    sqe.user_data = pack_user_data(key, .Socket);
+    sqe.user_data = @intFromEnum(key);
 }
 
 pub fn prep_connect(self: *Uring, key: Stream.Key, data: *Stream) void {
@@ -202,23 +186,17 @@ pub fn prep_connect(self: *Uring, key: Stream.Key, data: *Stream) void {
     var sqe = self.get_sqe();
     data.state = .Connect;
     sqe.prep_connect(data.fd, @ptrCast(&data.addr), data.addrlen);
-    sqe.user_data = pack_user_data(key, .Connect);
+    sqe.user_data = @intFromEnum(key);
 }
 
-pub fn prep_splice_read(self: *Uring, key: Stream.Key, data: *Stream) void {
+pub fn prep_send(self: *Uring, key: Stream.Key, data: *Stream, opposing: ?*Stream) void {
+    // SEND data buf to OPPOSING fd
+    assert(opposing != null);
+    assert(data.pos > 0);
+    data.state = .Send;
     var sqe = self.get_sqe();
-    data.state = .Read;
-    const null_offset = @as(u64, @bitCast(@as(i64, -1)));
-    sqe.prep_splice(data.fd, null_offset, data.pipefds[1], null_offset, 4096);
-    sqe.user_data = pack_user_data(key, .Read);
-}
-
-pub fn prep_splice_write(self: *Uring, key: Stream.Key, data: *Stream, opposing: *Stream) void {
-    var sqe = self.get_sqe();
-    data.state = .Write;
-    const null_offset = @as(u64, @bitCast(@as(i64, -1)));
-    sqe.prep_splice(data.pipefds[0], null_offset, opposing.fd, null_offset, 4096);
-    sqe.user_data = pack_user_data(key, .Write);
+    sqe.prep_send(opposing.?.fd, data.buf[0..@intCast(data.pos)], 0);
+    sqe.user_data = @intFromEnum(key);
 }
 
 pub fn cq_ready(self: *Uring) u32 {

@@ -67,8 +67,8 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
     defer conn_pool.deinit();
 
     const accept_key = try conn_pool.reserve();
-    var accept_data = conn_pool.get(accept_key).?;
-    try accept_data.init(sockfd, .Accept);
+    var accept_data = conn_pool.get(accept_key);
+    accept_data.init(sockfd, .Accept);
 
     uring.prep_multishot_accept(accept_key, accept_data);
 
@@ -83,123 +83,100 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
         }
         for (0..uring.cq_ready()) |_| {
             const cqe = uring.read().?;
-            const completion = Uring.unpack_user_data(cqe.user_data);
-            const cqe_key = completion.key;
+            const cqe_key: Stream.Key = @enumFromInt(cqe.user_data);
             try conn_pool.ensure_free_slots(1);
-            accept_data = conn_pool.get(accept_key).?;
-            const cqe_ptr = conn_pool.get(cqe_key);
-            if (cqe_ptr == null) {
-                std.debug.print("Stale CQE, ignoring\n", .{});
-                continue;
-            }
-            const cqe_data = cqe_ptr.?;
+            accept_data = conn_pool.get(accept_key);
+            const cqe_data: *Stream = conn_pool.get(cqe_key);
 
-            switch (completion.op) {
+            switch (cqe_data.state) {
                 .Accept => {
-                    if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error accepting connection: {any}\n", .{cqe.err()});
-                        continue;
-                    }
                     const connfd = cqe.res;
-                    std.debug.print("Got connection {d} from {d}\n", .{ cqe_data.fd, connfd });
+
+                    // const bytes: *const [4]u8 = @ptrCast(&accept_data.addr.data);
+                    // std.debug.print("Got connection {d} from {d}.{d}.{d}.{d}:{d}\n", .{ cqe_data.fd, bytes[0], bytes[1], bytes[2], bytes[3], accept_data.addr.port });
+
                     const conn_key = try conn_pool.reserve();
-                    const conn_data = conn_pool.get(conn_key).?;
-                    try conn_data.init(connfd, .Read);
+                    const conn_data = conn_pool.get(conn_key);
+                    conn_data.init(connfd, .Recv);
                     conn_data.addr = accept_data.addr;
                     conn_data.addrlen = accept_data.addrlen;
 
-                    const addr = select_upstream(connection_counter, upstream_addrs);
-                    const opposing = try conn_pool.reserve();
-                    const opposing_socket = conn_pool.get(opposing).?;
-                    try opposing_socket.init(0, .Socket);
-                    const n = addr.getOsSockLen();
-                    @memcpy(std.mem.asBytes(&opposing_socket.addr)[0..n], std.mem.asBytes(&addr)[0..n]);
-                    opposing_socket.addrlen = addr.getOsSockLen();
-                    opposing_socket.opposing = cqe_key;
-
-                    conn_data.opposing = opposing;
-                    opposing_socket.opposing = conn_key;
-
-                    uring.prep_socket(opposing, opposing_socket);
+                    uring.prep_recv(conn_key, conn_data);
                 },
-                .Socket => {
+                .Recv => {
                     if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error Creating socket: {any}\n", .{cqe.err()});
-                        continue;
+                        std.debug.print("Error receiving from sockfd {d}: {any}\n", .{ cqe_data.fd, cqe.err() });
                     }
 
+                    const nb = cqe.res;
+                    if (nb > 0) {
+                        cqe_data.pos += @intCast(nb);
+                        std.debug.print("READ {d} bytes from sock {d}\n", .{ nb, cqe_data.fd });
+                        cqe_data.state = .Send;
+                        if (cqe_data.opposing != null) {
+                            assert(cqe_data.opposing.? != cqe_key);
+                            uring.prep_send(cqe_key, cqe_data, conn_pool.get(cqe_data.opposing.?));
+                        } else {
+                            const addr = select_upstream(connection_counter, upstream_addrs);
+                            const opposing = try conn_pool.reserve();
+                            const opposing_socket = conn_pool.get(opposing);
+                            opposing_socket.init(0, .Socket);
+                            const n = addr.getOsSockLen();
+                            @memcpy(std.mem.asBytes(&opposing_socket.addr)[0..n], std.mem.asBytes(&addr)[0..n]);
+                            opposing_socket.addrlen = addr.getOsSockLen();
+                            opposing_socket.opposing = cqe_key;
+
+                            cqe_data.opposing = opposing;
+                            uring.prep_socket(opposing, opposing_socket);
+                        }
+                    } else if (nb == 0) {
+                        std.debug.print("Socket closed connection\n", .{});
+                        cqe_data.state = .Close;
+                        if (cqe_data.opposing) |opp| {
+                            std.debug.print("Closing reciprocal socket\n", .{});
+                            uring.prep_close(opp, conn_pool.get(opp));
+                        }
+                    }
+                },
+                .Socket => {
                     std.debug.print("Created socket {d}\n", .{cqe.res});
                     assert(cqe_data.opposing != null);
                     cqe_data.fd = cqe.res;
                     connection_counter += 1;
+                    assert(cqe.res > 0); // TODO: handle errors
                     uring.prep_connect(cqe_key, cqe_data);
-                },
-                .Shutdown => {
-                    std.debug.print("Socket shutdown successfully\n", .{});
-                    uring.prep_close(cqe_key, cqe_data);
                 },
                 .Connect => {
                     std.debug.print("Socket connected\n", .{});
-
                     assert(cqe_data.opposing != null);
                     const opp_key = cqe_data.opposing.?;
                     assert(opp_key != cqe_key);
-                    const opposing = conn_pool.get(opp_key).?;
-
+                    const opposing = conn_pool.get(opp_key);
                     if (cqe.err() != .SUCCESS) {
                         std.debug.print("Error Connecting to upstream: {any}\n", .{cqe.err()});
-                        // TODO: retry with different upstream if available
-                        uring.prep_shutdown(opp_key, opposing);
-                        continue;
+                        cqe_data.state = .Close;
+                        uring.prep_close(opp_key, opposing);
+                    } else {
+                        std.debug.print("Connected to upstream on socket {d}: response {d}\n", .{ cqe_data.fd, cqe.res });
+                        uring.prep_send(opp_key, opposing, cqe_data);
                     }
-
-                    std.debug.print("Connected to upstream on socket {d}: response {d}\n", .{ cqe_data.fd, cqe.res });
-
-                    cqe_data.state = .Read;
-                    std.debug.print("Starting splice from socket {d} with pipe {any}\n", .{ cqe_data.fd, cqe_data.pipefds });
-                    uring.prep_splice_read(cqe_key, cqe_data);
-
-                    opposing.state = .Read;
-                    std.debug.print("Starting splice from socket {d} with pipe {any}\n", .{ opposing.fd, opposing.pipefds });
-                    uring.prep_splice_read(opp_key, opposing);
                 },
-                .Read => {
-                    if (cqe_data.state == .Shutdown or cqe_data.state == .Close) {
-                        continue;
-                    }
+                .Send => {
                     if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error reading data on socket {d} with pipe {any}: {any}\n", .{ cqe_data.fd, cqe_data.pipefds, cqe.err() });
-                        uring.prep_shutdown(cqe_key, cqe_data);
-                        continue;
+                        std.debug.print("Error sending to sockfd: {any}\n", .{cqe.err()});
+                    } else {
+                        std.debug.print("SENT {d} bytes to sockfd\n", .{cqe.res});
+                        assert(cqe_data.opposing != null);
+                        assert(cqe_data.opposing.? != cqe_key);
+                        cqe_data.state = .Recv;
+                        cqe_data.clear();
+                        const opp_key = cqe_data.opposing.?;
+                        uring.prep_recv(opp_key, conn_pool.get(opp_key));
                     }
-                    std.debug.print("Splice data successfully read on socket {d} with pipe {any}\n", .{ cqe_data.fd, cqe_data.pipefds });
-                    const opp_key = cqe_data.opposing.?;
-                    assert(opp_key != cqe_key);
-                    const opposing = conn_pool.get(opp_key).?;
-
-                    if (cqe.res == 0) {
-                        std.debug.print("Socket closed connection, closing sockets {d} and {d}\n", .{ cqe_data.fd, opposing.fd });
-                        uring.prep_shutdown(cqe_key, cqe_data);
-                        uring.prep_shutdown(opp_key, opposing);
-                        continue;
-                    }
-
-                    uring.prep_splice_write(cqe_key, cqe_data, opposing);
-                },
-                .Write => {
-                    if (cqe_data.state == .Shutdown or cqe_data.state == .Close) {
-                        continue;
-                    }
-                    if (cqe.err() != .SUCCESS) {
-                        std.debug.print("Error transfering data on socket {d} with pipe {any}: {any}\n", .{ cqe_data.fd, cqe_data.pipefds, cqe.err() });
-                        uring.prep_shutdown(cqe_key, cqe_data);
-                        continue;
-                    }
-                    std.debug.print("Splice transfer with {d} bytes \n", .{cqe.res});
-                    uring.prep_splice_read(cqe_key, cqe_data);
                 },
                 .Close => {
                     std.debug.print("Connection {d} successfully closed\n", .{cqe_data.fd});
+                    conn_pool.release(cqe_data.opposing.?);
                     conn_pool.release(cqe_key);
                 },
                 .Cancel => {
