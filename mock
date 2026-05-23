@@ -1,4 +1,4 @@
 #!/bin/bash
 
 echo mock running on port $1
-ncat -6 -k -l $1 -c 'cat | tee /dev/tty'
+ncat -k -l $1 -c 'cat | tee /dev/tty'

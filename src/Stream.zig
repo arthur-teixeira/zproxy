@@ -34,7 +34,7 @@ const Stream = @This();
 
 state: State,
 opposing: ?Key,
-addr: linux.sockaddr.storage,
+addr: linux.sockaddr.in,
 fd: i32,
 addrlen: linux.socklen_t,
 buf: [4096]u8,
@@ -45,7 +45,7 @@ pub fn init(self: *Stream, connfd: i32, state: State) void {
         .state = state,
         .pos = 0,
         .buf = @splat(0),
-        .addr = std.mem.zeroes(linux.sockaddr.storage),
+        .addr = std.mem.zeroes(linux.sockaddr.in),
         .addrlen = linux.sockaddr.SS_MAXSIZE,
         .opposing = null,
         .fd = connfd,
