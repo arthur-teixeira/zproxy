@@ -2,6 +2,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const Upstream = @import("./upstreams.zig").Upstream;
 const assert = std.debug.assert;
 
 // (Ideal) State sequence
@@ -26,6 +27,7 @@ pub const State = enum {
     Connect,
     Read,
     Write,
+    Timeout,
     Shutdown,
     Close,
     Cancel,
@@ -33,6 +35,7 @@ pub const State = enum {
 
 const Stream = @This();
 
+upstream_key: ?usize,
 state: State,
 opposing: ?Key,
 addr: linux.sockaddr.storage,
@@ -51,6 +54,7 @@ pub fn init(self: *Stream, connfd: i32, state: State) !void {
         .addr = std.mem.zeroes(linux.sockaddr.storage),
         .addrlen = linux.sockaddr.SS_MAXSIZE,
         .opposing = null,
+        .upstream_key = null,
         .fd = connfd,
     };
 }
@@ -58,6 +62,13 @@ pub fn init(self: *Stream, connfd: i32, state: State) !void {
 pub fn clear(self: *Stream) void {
     self.buf = @splat(0);
     self.pos = 0;
+}
+
+pub fn set_upstream(self: *Stream, upstream: Upstream) void {
+    const n = upstream.addr.getOsSockLen();
+    @memcpy(std.mem.asBytes(&self.addr)[0..n], std.mem.asBytes(&upstream.addr)[0..n]);
+    self.upstream_key = upstream.key;
+    self.addrlen = n;
 }
 
 pub const Key = enum(u64) {

@@ -1,17 +1,18 @@
 {
   "proxy": {
+    "timeout": 5000,
     "address": "0.0.0.0",
     "port": 9999
   },
   "upstream": [
     {
       "name": "server1",
-      "address": "api1",
+      "address": "localhost",
       "port": 3030
     },
     {
       "name": "server2",
-      "address": "api2",
+      "address": "localhost",
       "port": 3031
     }
   ]

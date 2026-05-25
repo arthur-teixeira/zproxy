@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 const Stream = @import("./Stream.zig");
 const Uring = @import("./Uring.zig");
 const Config = @import("./config.zig");
+const UpstreamManager = @import("./upstreams.zig");
 
 pub const test_sync = if (builtin.is_test)
     struct {
@@ -33,35 +34,13 @@ fn setup_listener_sock(cfg: Config.Value) !i32 {
     return sockfd;
 }
 
-fn resolve_upstreams(allocator: Allocator, config: Config.Value) ![]std.net.Address {
-    var addresses = try allocator.alloc(std.net.Address, config.upstream.len);
-    for (config.upstream, 0..) |u, i| {
-        const list = try std.net.getAddressList(allocator, u.address, u.port);
-        defer list.deinit();
-
-        if (list.addrs.len == 0) {
-            return error.NoUpstreamAddresses;
-        }
-        addresses[i] = list.addrs[0];
-    }
-
-    return addresses;
-}
-
-fn select_upstream(connection_counter: usize, addresses: []std.net.Address) std.net.Address {
-    const i = connection_counter % addresses.len;
-    return addresses[i];
-}
-
 pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.Value(bool)) !void {
-    var uring: Uring = try .init(256);
+    var uring: Uring = try .init(256, config.proxy.timeout.?);
     defer uring.deinit();
     const sockfd = try setup_listener_sock(config);
     defer posix.close(sockfd);
 
-    var connection_counter: usize = 0;
-    const upstream_addrs = try resolve_upstreams(allocator, config);
-    defer allocator.free(upstream_addrs);
+    var upstream_manager: UpstreamManager = try .init(allocator, config);
 
     var conn_pool = try Stream.Pool.init(allocator, 4096);
     defer conn_pool.deinit();
@@ -105,15 +84,14 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                     conn_data.addr = accept_data.addr;
                     conn_data.addrlen = accept_data.addrlen;
 
-                    const addr = select_upstream(connection_counter, upstream_addrs);
                     const opposing = try conn_pool.reserve();
                     const opposing_socket = conn_pool.get(opposing).?;
                     try opposing_socket.init(0, .Socket);
-                    const n = addr.getOsSockLen();
-                    @memcpy(std.mem.asBytes(&opposing_socket.addr)[0..n], std.mem.asBytes(&addr)[0..n]);
-                    opposing_socket.addrlen = addr.getOsSockLen();
-                    opposing_socket.opposing = cqe_key;
 
+                    const upstream_addr = upstream_manager.select_upstream();
+                    opposing_socket.set_upstream(upstream_addr);
+
+                    opposing_socket.opposing = cqe_key;
                     conn_data.opposing = opposing;
                     opposing_socket.opposing = conn_key;
 
@@ -126,7 +104,6 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
 
                     assert(cqe_data.opposing != null);
                     cqe_data.fd = cqe.res;
-                    connection_counter += 1;
                     uring.prep_connect(cqe_key, cqe_data);
                 },
                 .Shutdown => {
@@ -139,10 +116,16 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                     const opposing = conn_pool.get(opp_key).?;
 
                     if (cqe.err() != .SUCCESS) {
-                        // TODO: retry with different upstream if available
-                        uring.prep_shutdown(opp_key, opposing);
+                        std.debug.print("Could not connect to {any}\n", .{cqe_data.upstream_key});
+                        upstream_manager.report_health(cqe_data.upstream_key.?, false);
+                        const upstream_addr = upstream_manager.select_upstream();
+                        cqe_data.set_upstream(upstream_addr);
+                        uring.prep_connect(cqe_key, cqe_data);
                         continue;
                     }
+
+                    std.debug.print("Connected successfully to {any}\n", .{cqe_data.upstream_key});
+                    upstream_manager.report_health(cqe_data.upstream_key.?, true);
 
                     cqe_data.state = .Read;
                     uring.prep_splice_read(cqe_key, cqe_data);
@@ -179,6 +162,20 @@ pub fn proxy(allocator: Allocator, config: Config.Value, running: ?*std.atomic.V
                         continue;
                     }
                     uring.prep_splice_read(cqe_key, cqe_data);
+                },
+                .Timeout => {
+                    const timed_out = cqe.err() == .TIME;
+                    if (!timed_out) {
+                        continue;
+                    }
+
+                    const opp_key = cqe_data.opposing.?;
+                    assert(opp_key != cqe_key);
+                    if (conn_pool.get(opp_key)) |opposing| {
+                        uring.prep_shutdown(opp_key, opposing);
+                    }
+
+                    uring.prep_shutdown(cqe_key, cqe_data);
                 },
                 .Close => {
                     conn_pool.release(cqe_key);

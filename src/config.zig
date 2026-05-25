@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const json = std.json;
 
 const Config = @This();
+const FIVE_MINUTES = 10000 * 60 * 5;
 
 pub const Value = struct {
     upstream: []Upstream,
@@ -15,11 +16,12 @@ parsed: json.Parsed(Value),
 pub const Upstream = struct {
     address: []const u8,
     port: u16,
-    name: []const u8,
+    name: ?[]const u8,
 };
 
 pub const Proxy = struct {
     address: []const u8,
+    timeout: ?u64 = FIVE_MINUTES,
     port: u16,
 };
 

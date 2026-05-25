@@ -10,6 +10,7 @@ fd: i32,
 sq: Sq,
 cq: Cq,
 single_mmap: bool,
+timeout: linux.kernel_timespec,
 
 pub const Completion = struct {
     key: Stream.Key,
@@ -35,7 +36,7 @@ const Cq = struct {
     cqes: [*]linux.io_uring_cqe,
 };
 
-pub fn init(size: u32) !Uring {
+pub fn init(size: u32, timeout_ms: u64) !Uring {
     var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
     const ring_fd = linux.io_uring_setup(size, &params);
     switch (linux.E.init(ring_fd)) {
@@ -111,7 +112,13 @@ pub fn init(size: u32) !Uring {
 
     const cqes: [*]linux.io_uring_cqe = @ptrFromInt(cq_int + @as(u64, params.cq_off.cqes));
 
+    const timeout: linux.kernel_timespec = .{
+        .sec = @intCast(@divTrunc(timeout_ms, 1000)),
+        .nsec = @intCast((timeout_ms % 1000) * 1_000_000),
+    };
+
     return .{
+        .timeout = timeout,
         .fd = @intCast(ring_fd),
         .single_mmap = single_mmap,
         .cq = .{
@@ -158,7 +165,6 @@ pub fn unpack_user_data(user_data: u64) Completion {
 }
 
 pub fn prep_multishot_accept(self: *Uring, key: Stream.Key, data: *Stream) void {
-    assert(data.state == .Accept);
     var sqe = self.get_sqe();
     sqe.prep_multishot_accept(data.fd, @ptrCast(&data.addr), &data.addrlen, 0);
     sqe.user_data = pack_user_data(key, .Accept);
@@ -181,44 +187,49 @@ pub fn prep_shutdown(self: *Uring, key: Stream.Key, data: *Stream) void {
 
 pub fn prep_close(self: *Uring, key: Stream.Key, data: *Stream) void {
     // should only close an end if the other end closed first
-    data.state = .Close;
     var sqe = self.get_sqe();
     sqe.prep_close(data.fd);
+    data.state = .Close;
     sqe.user_data = pack_user_data(key, .Close);
 }
 
 pub fn prep_socket(self: *Uring, key: Stream.Key, data: *Stream) void {
     assert(data.fd == 0);
     var sqe = self.get_sqe();
-    data.state = .Socket;
     const sa: *const linux.sockaddr = @ptrCast(&data.addr);
     sqe.prep_socket(sa.family, linux.SOCK.STREAM, 0, 0);
     sqe.user_data = pack_user_data(key, .Socket);
 }
 
 pub fn prep_connect(self: *Uring, key: Stream.Key, data: *Stream) void {
-    assert(data.state == .Socket);
     assert(data.fd > 0);
     var sqe = self.get_sqe();
-    data.state = .Connect;
     sqe.prep_connect(data.fd, @ptrCast(&data.addr), data.addrlen);
     sqe.user_data = pack_user_data(key, .Connect);
 }
 
 pub fn prep_splice_read(self: *Uring, key: Stream.Key, data: *Stream) void {
     var sqe = self.get_sqe();
-    data.state = .Read;
     const null_offset = @as(u64, @bitCast(@as(i64, -1)));
     sqe.prep_splice(data.fd, null_offset, data.pipefds[1], null_offset, 4096);
     sqe.user_data = pack_user_data(key, .Read);
+    sqe.link_next();
+    self.prep_link_timeout(key);
 }
 
 pub fn prep_splice_write(self: *Uring, key: Stream.Key, data: *Stream, opposing: *Stream) void {
     var sqe = self.get_sqe();
-    data.state = .Write;
     const null_offset = @as(u64, @bitCast(@as(i64, -1)));
     sqe.prep_splice(data.pipefds[0], null_offset, opposing.fd, null_offset, 4096);
     sqe.user_data = pack_user_data(key, .Write);
+    sqe.link_next();
+    self.prep_link_timeout(key);
+}
+
+pub fn prep_link_timeout(self: *Uring, key: Stream.Key) void {
+    var sqe = self.get_sqe();
+    sqe.prep_link_timeout(&self.timeout, 0);
+    sqe.user_data = pack_user_data(key, .Timeout);
 }
 
 pub fn cq_ready(self: *Uring) u32 {
